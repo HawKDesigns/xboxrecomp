@@ -10,9 +10,11 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    kernel_missing.c
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
+    kernel_guest_cpu.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c
@@ -25,6 +27,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
     nv2a_gpu_raster.c
@@ -62,5 +65,10 @@ else()
     set_source_files_properties(nv2a_vsh_interp.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
+
+# The trapped-MMIO dispatch (xbox_VehMmioFault, xbox_PosixMmioFault) routes
+# to the APU and the USB OHCI models. Link-only: both already call back into
+# the kernel, and CMake repeats static libraries in such a cycle.
+target_link_libraries(xbox_kernel PRIVATE xbox_apu xbox_usb)
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)

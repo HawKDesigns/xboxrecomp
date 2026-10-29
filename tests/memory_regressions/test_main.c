@@ -23,7 +23,12 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default keeps the bump allocator.
+ *      request of that size reuses it; the default never reuses one.
+ *   7. (default too) MmAllocateContiguousMemoryEx's physical range is
+ *      honoured. A request limited to the low 16 MB still succeeds once
+ *      unconstrained requests have filled up to it -- XDK D3D's visibility
+ *      test report pages ask for exactly that, and a bump pointer refused
+ *      every one -- and a request for a range above the pointer lands in it.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -50,6 +55,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
@@ -180,13 +186,14 @@ int main(int argc, char **argv)
     int reclaim = !strcmp(mode, "heap-reclaim");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
+    int avoid = !strcmp(mode, "contig-avoid-image");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -194,6 +201,8 @@ int main(int argc, char **argv)
         set_env("RECOMP_HEAP_RECLAIM", "1");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
+    if (avoid)
+        set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -220,6 +229,21 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
+
+    /* 0. A contiguous block and the loaded image share physical numbers
+     * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
+    if (!ext) {
+        uint32_t c = xbox_ContiguousAlloc(1024u * 1024u, 4096);
+        uint32_t phys = c - XBOX_CONTIG_BASE;
+        int overlaps = phys < g_xbox_image_hi && phys + 1024u * 1024u > g_xbox_image_lo;
+        snprintf(d, sizeof d, "block 0x%08X, image 0x%08X..0x%08X",
+                 c, g_xbox_image_lo, g_xbox_image_hi);
+        if (avoid)
+            check(c && !overlaps, "avoid-image: a 1 MB block lands outside the image", d);
+        else
+            check(c && overlaps, "a 1 MB block still fills from the bottom by default", d);
+        xbox_ContiguousFree(c);
+    }
 
     /* 1. A small request after a large free. */
     if (!ext) {
@@ -301,7 +325,6 @@ int main(int argc, char **argv)
 
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
-        extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
 
@@ -313,6 +336,42 @@ int main(int argc, char **argv)
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
         } else {
             check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
+        }
+    }
+
+    /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t c = 0, lo, hi;
+        int k;
+
+        /* Unconstrained 1 MB blocks until one lands at or above 16 MB. */
+        for (k = 0; k < 32; k++) {
+            c = xbox_ContiguousAlloc(MB, 4096);
+            if (!c || c - XBOX_CONTIG_BASE >= 16 * MB)
+                break;
+        }
+        lo = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
+        snprintf(d, sizeof d, "last unconstrained 0x%08X, low request 0x%08X", c, lo);
+        check(c && lo && lo + 0x1000 - XBOX_CONTIG_BASE <= 16 * MB,
+              "a request limited to the low 16 MB still fits", d);
+
+        hi = xbox_ContiguousAllocEx(0x10000, 0x10000, 0x02800000u, 0x02FFFFFFu);
+        snprintf(d, sizeof d, "got 0x%08X", hi);
+        check(hi && hi - XBOX_CONTIG_BASE >= 0x02800000u &&
+              hi + 0x10000 - XBOX_CONTIG_BASE <= 0x03000000u &&
+              (hi & 0xFFFFu) == 0,
+              "a request for a range above the fill lands in it, aligned", d);
+
+        /* A caller-placed block that overlaps hi's last page still claims
+         * the free pages after it, so they are not handed out again. */
+        if (hi) {
+            uint32_t after = hi + 0x10000, again;
+            xbox_ContiguousClaim(after - 0x1000, 0x3000);
+            again = xbox_ContiguousAllocEx(0x1000, 4096, after - XBOX_CONTIG_BASE,
+                                           after - XBOX_CONTIG_BASE + 0x1FFF);
+            snprintf(d, sizeof d, "got 0x%08X", again);
+            check(again == 0, "a partly overlapped claim keeps its free pages", d);
         }
     }
 
@@ -330,6 +389,23 @@ int main(int argc, char **argv)
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
             check(base != hi, "default: an explicit high base is not honoured", d);
         } else if (ext) {
+            /* The layout's own reservations (the Windows placeholder window,
+             * the POSIX span) cover this range; it must hand it over, or the
+             * tracker finds nothing free and stays off. */
+            check(guest_vmem_active(),
+                  "the tracker is on: the layout handed its range over",
+                  "\"could not reserve host memory\": the placeholder window "
+                  "or the span still held the range");
+            /* And the windows above it are still mapped: on Linux a span
+             * grown to make room pushed the contiguous window onto a
+             * neighbouring mapping. Writing to it faults if it is missing. */
+            {
+                uint32_t c = xbox_ContiguousAlloc(0x1000, 4096);
+                if (c)
+                    *G(c) = 0x5A5A5A5Au;
+                check(c && *G(c) == 0x5A5A5A5Au,
+                      "the contiguous window is mapped beside the tracker", NULL);
+            }
             /* Reserve the exact address. */
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);

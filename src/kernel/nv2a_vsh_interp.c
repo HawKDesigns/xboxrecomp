@@ -497,10 +497,18 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     if (p) {
         ++s_native_runs;
         p->run(in, out);
-        return 1;
+    } else {
+        ++s_interpreted_runs;
+        if (!nv2a_vsh_run_interpreted(in, out)) return 0;
     }
-    ++s_interpreted_runs;
-    return nv2a_vsh_run_interpreted(in, out);
+    /* Apply the NV2A colour output clamp to both the interpreted and
+     * locally generated fast path. The two paths must agree for QPR2. */
+    for (int k = 0; k < 4; ++k) {
+        float d0 = out->d0[k], d1 = out->d1[k];
+        out->d0[k] = d0 > 1.0f ? 1.0f : (d0 >= 0.0f ? d0 : 0.0f);
+        out->d1[k] = d1 > 1.0f ? 1.0f : (d1 >= 0.0f ? d1 : 0.0f);
+    }
+    return 1;
 }
 
 void nv2a_vsh_report(void)
