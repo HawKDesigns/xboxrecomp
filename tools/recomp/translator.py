@@ -2496,6 +2496,13 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
+            # Publish the guest basic block independently of the native host
+            # instruction pointer.  A watchdog sampling lifted C otherwise
+            # sees only registers and the last call, which cannot identify a
+            # call-free busy loop.  One volatile store per entered block is a
+            # deliberate diagnostic cost and gives an exact XBE address.
+            lines.append(f"    RECOMP_PC(0x{bb.start:08X}u);")
+
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
             # states come from the pre-pass above, so a back edge's

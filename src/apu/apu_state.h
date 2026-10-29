@@ -24,6 +24,7 @@
 #include "apu_shim.h"
 #include "apu_regs.h"
 #include "apu_debug.h"
+#include "apu_rate_converter.h"
 
 /* ============================================================
  * DSP CPU registers
@@ -210,6 +211,7 @@ typedef struct {
     } ch[2];
     float itd_cur;
     float itd_tar;
+    bool has_target;
 } HrtfFilter;
 
 static inline void hrtf_filter_init(HrtfFilter *f) {
@@ -227,6 +229,7 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
                               float itd) {
     f->itd_tar = fmaxf(-(float)HRTF_MAX_DELAY_SAMPLES,
                         fminf(itd, (float)HRTF_MAX_DELAY_SAMPLES));
+    f->has_target = true;
     for (int ch = 0; ch < 2; ch++) {
         float *coeff = f->ch[ch].hrir_coeff_tar;
         memcpy(coeff, hrir_coeff[ch], sizeof(f->ch[ch].hrir_coeff_tar));
@@ -234,7 +237,8 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             s += fabsf(coeff[k]);
         }
-        if (s == 0.0f || s == 1.0f) break;
+        /* A zero/unity left filter must not skip copying the right ear. */
+        if (s == 0.0f || s == 1.0f) continue;
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
             coeff[k] /= s;
         }
@@ -270,18 +274,19 @@ static inline void hrtf_filter_process(HrtfFilter *f,
             int di = (int)d;
             float dfrac = d - di;
             float acc = 0.0f;
+            int idx1 = f->buf_pos - di;
+            if (idx1 < 0) idx1 += HRTF_BUFLEN;
             for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-                int idx1 = (f->buf_pos - di - k + HRTF_BUFLEN) % HRTF_BUFLEN;
+                int idx2 = idx1 ? idx1 - 1 : HRTF_BUFLEN - 1;
                 float s = buf[idx1];
-                if (dfrac > 0.0f) {
-                    int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
+                if (dfrac > 0.0f)
                     s = s * (1 - dfrac) + buf[idx2] * dfrac;
-                }
                 acc += coeff[k] * s;
+                idx1 = idx2;
             }
             out[n][ch] = acc;
         }
-        f->buf_pos = (f->buf_pos + 1) % HRTF_BUFLEN;
+        if (++f->buf_pos == HRTF_BUFLEN) f->buf_pos = 0;
     }
 }
 
@@ -380,6 +385,11 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    APUVoiceRateConverter rate_converter;
+    bool resample_end;
+    bool rate_diag_valid;
+    uint32_t rate_diag_format;
+    int16_t rate_diag_pitch;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
@@ -417,6 +427,9 @@ typedef struct MCPXAPUVPState {
 
     int ssl_base_page;
     MCPXAPUVPSSLData ssl[MCPX_HW_MAX_VOICES];
+    struct {
+        uint64_t mono_2d, stereo_2d, filtered_3d, bypass_3d, missing_3d;
+    } stereo;
     uint8_t hrtf_headroom;
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
@@ -428,6 +441,7 @@ typedef struct MCPXAPUVPState {
         struct {
             float hrir[2][HRTF_NUM_TAPS];
             float itd;
+            bool written;
         } entries[HRTF_ENTRY_COUNT];
     } hrtf;
 
@@ -505,6 +519,7 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        float mix_buf[256][2]; /* PCM units, unclipped until final output */
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;
@@ -515,6 +530,24 @@ struct MCPXAPUState {
  * ============================================================ */
 
 /* VP functions */
+typedef struct MCPXAPUStateLayout {
+    size_t size, filters, ssl, regs, monitor, frame_div;
+} MCPXAPUStateLayout;
+
+static inline MCPXAPUStateLayout mcpx_apu_local_state_layout(void)
+{
+    MCPXAPUStateLayout layout = {
+        sizeof(MCPXAPUState), offsetof(MCPXAPUState, vp.filters),
+        offsetof(MCPXAPUState, vp.ssl), offsetof(MCPXAPUState, regs),
+        offsetof(MCPXAPUState, monitor), offsetof(MCPXAPUState, ep_frame_div)
+    };
+    return layout;
+}
+
+MCPXAPUStateLayout mcpx_apu_vp_state_layout(void);
+MCPXAPUStateLayout mcpx_apu_dsp_state_layout(void);
+bool mcpx_apu_validate_state_layout(void);
+
 void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);

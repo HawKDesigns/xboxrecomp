@@ -375,6 +375,61 @@ static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
  * lines through the shared stderr lock -- the frame rate fell to ~1 FPS. */
 static long long g_kernel_call_count = 0;
 
+/* A no-I/O progress trace for bring-up runs.
+ *
+ * Logging every bridge to a redirected file can itself dominate execution on
+ * some Windows volumes. Keep the last calls in memory and let the watchdog
+ * print them once at the end. This remains useful when
+ * RECOMP_KERNEL_LOG_BUDGET=0 disables the live call trace. */
+#define KERNEL_PROGRESS_SLOTS 64
+typedef struct {
+    volatile LONG64 sequence;
+    ULONGLONG started_ms;
+    volatile ULONGLONG finished_ms;
+    ULONG ordinal;
+    int slot;
+    uint32_t caller;
+} KERNEL_PROGRESS_ENTRY;
+
+static void bridge_wait_dump(void);
+static KERNEL_PROGRESS_ENTRY g_kernel_progress[KERNEL_PROGRESS_SLOTS];
+static volatile LONG g_kernel_progress_write;
+static ULONGLONG g_kernel_progress_epoch;
+
+void xbox_KernelProgressDump(void)
+{
+    bridge_wait_dump();
+    LONG total = g_kernel_progress_write;
+    LONG first = total > KERNEL_PROGRESS_SLOTS
+               ? total - KERNEL_PROGRESS_SLOTS : 0;
+    LONG i;
+
+    fprintf(stderr, "  [KPROGRESS] %ld kernel calls recorded\n", total);
+    for (i = first; i < total; i++) {
+        KERNEL_PROGRESS_ENTRY *p =
+            &g_kernel_progress[(unsigned)i & (KERNEL_PROGRESS_SLOTS - 1)];
+        LONG64 sequence = p->sequence;
+        ULONGLONG end = p->finished_ms;
+        if (!sequence)
+            continue;
+        if (end) {
+            fprintf(stderr,
+                    "  [KPROGRESS] t=%llums #%lld ord=%lu slot=%d caller=%08X duration=%llums\n",
+                    (unsigned long long)(p->started_ms - g_kernel_progress_epoch),
+                    (long long)sequence, (unsigned long)p->ordinal, p->slot,
+                    p->caller,
+                    (unsigned long long)(end - p->started_ms));
+        } else {
+            fprintf(stderr,
+                    "  [KPROGRESS] t=%llums #%lld ord=%lu slot=%d caller=%08X still-running\n",
+                    (unsigned long long)(p->started_ms - g_kernel_progress_epoch),
+                    (long long)sequence, (unsigned long)p->ordinal, p->slot,
+                    p->caller);
+        }
+    }
+    fflush(stderr);
+}
+
 /* How many kernel calls get logged before the log goes quiet.
  *
  * The cap keeps a title that makes thousands of calls from burying the
@@ -671,22 +726,58 @@ static HANDLE bridge_take_handle(uint32_t token);
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
+#ifdef _WIN32
+    ULONGLONG close_started = GetTickCount64();
+#endif
 
     if (KERNEL_LOG_ON()) {
-        fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
+        fprintf(stderr, "  [CLOSE] begin handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
 
     bridge_forget_async_handle(raw_handle);
+    if (KERNEL_LOG_ON()) {
+#ifdef _WIN32
+        fprintf(stderr, "  [CLOSE] async bookkeeping done +%llums\n",
+                (unsigned long long)(GetTickCount64() - close_started));
+#else
+        fprintf(stderr, "  [CLOSE] async bookkeeping done\n");
+#endif
+        fflush(stderr);
+    }
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
+        if (KERNEL_LOG_ON()) {
+#ifdef _WIN32
+            fprintf(stderr, "  [CLOSE] resolved host handle=%p +%llums\n",
+                    (void *)h,
+                    (unsigned long long)(GetTickCount64() - close_started));
+#else
+            fprintf(stderr, "  [CLOSE] resolved host handle=%p\n", (void *)h);
+#endif
+            fflush(stderr);
+        }
         if (h && h != INVALID_HANDLE_VALUE) {
 #ifdef _WIN32
             xbox_dir_context_drop(h);
+            if (KERNEL_LOG_ON()) {
+                fprintf(stderr, "  [CLOSE] directory context dropped +%llums\n",
+                        (unsigned long long)(GetTickCount64() - close_started));
+                fflush(stderr);
+            }
 #endif
             CloseHandle(h);
+            if (KERNEL_LOG_ON()) {
+#ifdef _WIN32
+                fprintf(stderr, "  [CLOSE] host handle closed +%llums\n",
+                        (unsigned long long)(GetTickCount64() - close_started));
+#else
+                fprintf(stderr, "  [CLOSE] host handle closed\n");
+#endif
+                fflush(stderr);
+            }
         }
     }
     g_eax = 0; /* STATUS_SUCCESS */
@@ -1513,6 +1604,59 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
+/* An outstanding wait must survive the rolling call-history buffer. Capture
+ * guest stack values before blocking, rather than inspecting a live stack
+ * from the watchdog or waiting for a hung call to return. */
+#define BRIDGE_WAIT_SLOTS 64
+typedef struct {
+    int active;DWORD thread,started,reported;
+    uint32_t ordinal,object,caller,sp,frame,timeout;
+    HANDLE host;
+    uint32_t stack[24],saved_frame[8];
+} BridgeWait;
+static BridgeWait s_waits[BRIDGE_WAIT_SLOTS];
+static SRWLOCK s_wait_lock=SRWLOCK_INIT;
+static int bridge_wait_begin(uint32_t ordinal,uint32_t object,HANDLE host,uint32_t timeout)
+{
+    BridgeWait next;memset(&next,0,sizeof next);
+    next.active=1;next.thread=GetCurrentThreadId();next.started=GetTickCount();
+    next.ordinal=ordinal;next.object=object;next.host=host;
+    next.caller=g_xbox_kernel_caller;next.sp=g_esp;next.frame=g_seh_ebp;next.timeout=timeout;
+    if(next.sp && bridge_va_mapped(next.sp,sizeof next.stack))memcpy(next.stack,XBOX_TO_NATIVE(next.sp),sizeof next.stack);
+    if(next.frame && bridge_va_mapped(next.frame,sizeof next.saved_frame))memcpy(next.saved_frame,XBOX_TO_NATIVE(next.frame),sizeof next.saved_frame);
+    int slot=-1;
+    AcquireSRWLockExclusive(&s_wait_lock);
+    for(int i=0;i<BRIDGE_WAIT_SLOTS;i++)if(!s_waits[i].active){s_waits[i]=next;slot=i;break;}
+    ReleaseSRWLockExclusive(&s_wait_lock);
+    return slot;
+}
+static void bridge_wait_end(int slot)
+{
+    if(slot<0)return;
+    AcquireSRWLockExclusive(&s_wait_lock);s_waits[slot].active=0;ReleaseSRWLockExclusive(&s_wait_lock);
+}
+static void bridge_wait_dump(void)
+{
+    AcquireSRWLockExclusive(&s_wait_lock);
+    DWORD now=GetTickCount();
+    for(int i=0;i<BRIDGE_WAIT_SLOTS;i++) {
+        BridgeWait *p=&s_waits[i];
+        if(!p->active || (DWORD)(now-p->started)<1500u ||
+           (p->reported && (DWORD)(now-p->reported)<5000u))continue;
+        p->reported=now;
+        fprintf(stderr,"[WAIT-ACTIVE] thread=%lu ordinal=%u caller=%08X object=%08X host=%p elapsed_ms=%lu timeout=%08X esp=%08X frame=%08X\n",
+            (unsigned long)p->thread,p->ordinal,p->caller,p->object,p->host,
+            (unsigned long)(now-p->started),p->timeout,p->sp,p->frame);
+        fprintf(stderr,"[WAIT-STACK] thread=%lu sp=%08X",(unsigned long)p->thread,p->sp);
+        for(unsigned j=0;j<24;j++)fprintf(stderr," %08X",p->stack[j]);
+        fprintf(stderr," frame=%08X",p->frame);
+        for(unsigned j=0;j<8;j++)fprintf(stderr," %08X",p->saved_frame[j]);
+        fprintf(stderr,"\n");
+    }
+    ReleaseSRWLockExclusive(&s_wait_lock);
+}
+void xbox_KernelWaitDump(void){bridge_wait_dump();}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -1568,9 +1712,11 @@ static void bridge_KeWaitForSingleObject(void)
             } else {
                 SetEvent(ge);                          /* set by a header write */
             }
+            int trace=bridge_wait_begin(159,object,ge,timeout_ptr);
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+            bridge_wait_end(trace);
             if (g_eax == 0 && type == 1)               /* synchronization: consumed */
                 BRIDGE_MEM32(object + 4) = 0;
             return;
@@ -1583,9 +1729,11 @@ static void bridge_KeWaitForSingleObject(void)
     if (!h)
         h = XBOX_TO_NATIVE(object);
 
+    int trace=bridge_wait_begin(159,object,h,timeout_ptr);
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    bridge_wait_end(trace);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -1650,6 +1798,8 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
+    uint32_t token=STACK_ARG(0), caller=g_xbox_kernel_caller;
+    DWORD begin=GetTickCount();
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
@@ -1663,9 +1813,20 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
+    int trace=bridge_wait_begin(234,token,handle,timeout_ptr);
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    bridge_wait_end(trace);
+    /* Diagnose an alert/retry loop or an asset-loader wait separately from
+     * graphics setup, without synthesizing a completion or changing timeout. */
+    static __declspec(thread) DWORD reported;
+    DWORD end=GetTickCount(),elapsed=end-begin;
+    if((elapsed>=100u || g_eax!=0) && (DWORD)(end-reported)>=5000u) {
+        reported=end;
+        fprintf(stderr,"[WAIT-RESULT] thread=%lu caller=%08X token=%08X mode=%u alertable=%u timeout=%08X status=%08X elapsed_ms=%lu\n",
+            (unsigned long)GetCurrentThreadId(),caller,token,wait_mode,alertable,timeout_ptr,g_eax,(unsigned long)elapsed);
+    }
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -2809,18 +2970,27 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+/* A worker may create an object before PsCreateSystemThreadEx publishes its
+ * thread handle. Allocation, resolution and removal share one table lock. */
+static SRWLOCK s_handle_lock=SRWLOCK_INIT;
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
     int i;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    AcquireSRWLockExclusive(&s_handle_lock);
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        if (s_handle_table[i] == h) {
+            ReleaseSRWLockExclusive(&s_handle_lock);
+            return BRIDGE_HANDLE_TAG | (uint32_t)i;
+        }
     for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            ReleaseSRWLockExclusive(&s_handle_lock);
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+    ReleaseSRWLockExclusive(&s_handle_lock);
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
 }
@@ -2838,7 +3008,11 @@ static HANDLE bridge_read_handle(uint32_t va)
     uint32_t token = BRIDGE_MEM32(va);
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        HANDLE h=NULL;
+        AcquireSRWLockShared(&s_handle_lock);
+        if(i>0 && i<BRIDGE_HANDLE_MAX)h=s_handle_table[i];
+        ReleaseSRWLockShared(&s_handle_lock);
+        return h;
     }
     /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
@@ -2861,7 +3035,11 @@ static HANDLE bridge_resolve_handle(uint32_t token)
 {
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
+        HANDLE h=NULL;
+        AcquireSRWLockShared(&s_handle_lock);
+        if(i>0 && i<BRIDGE_HANDLE_MAX)h=s_handle_table[i];
+        ReleaseSRWLockShared(&s_handle_lock);
+        return h;
     }
     /* Pseudo-handles (NtCurrentProcess() = -1, NtCurrentThread() = -2) are
      * negative. Zero-extending them on a 64-bit host yields 0x00000000FFFFFFFE,
@@ -2878,8 +3056,10 @@ static HANDLE bridge_take_handle(uint32_t token)
     if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
+            AcquireSRWLockExclusive(&s_handle_lock);
             HANDLE h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            ReleaseSRWLockExclusive(&s_handle_lock);
             return h;
         }
     }
@@ -3880,6 +4060,22 @@ static void bridge_NtFsControlFile(void)
 {
     uint32_t fsctl = STACK_ARG(5);
     uint32_t ios_va = STACK_ARG(4);
+
+    /* FSCTL_DISMOUNT_VOLUME. QPR2 issues this after formatting its FATX cache
+     * partition, then immediately closes and reopens the raw device. The host
+     * representation is an ordinary image file, so flushing it is the useful
+     * part of a dismount; returning STATUS_NOT_SUPPORTED makes a successful
+     * format look incomplete to the title. */
+    if (fsctl == 0x00090020u) {
+        HANDLE h = bridge_resolve_handle(STACK_ARG(0));
+        if (h && h != INVALID_HANDLE_VALUE)
+            FlushFileBuffers(h);
+        fprintf(stderr, "  [FILE] NtFsControlFile(FSCTL_DISMOUNT_VOLUME) -> success\n");
+        bridge_write_iostatus(ios_va, STATUS_SUCCESS, 0);
+        g_eax = STATUS_SUCCESS;
+        return;
+    }
+
     fprintf(stderr, "  [FILE] NtFsControlFile(0x%X) - stub\n", fsctl);
     bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
     g_eax = 0xC00000BBu;
@@ -4206,6 +4402,10 @@ static void bridge_NtCreateMutant(void)
     st = xbox_NtCreateMutant(&h, STACK_ARG(1) ? &oa : NULL,
                              (BOOLEAN)STACK_ARG(2));
     if (st >= 0 && handle_va) bridge_write_handle(handle_va, h);
+    static volatile LONG shown;
+    if(InterlockedIncrement(&shown)<=32)fprintf(stderr,"[SYNC-CREATE] kind=mutant slot=%08X token=%08X host=%p owner=%u thread=%lu caller=%08X status=%08X\n",
+        handle_va,handle_va?BRIDGE_MEM32(handle_va):0,h,STACK_ARG(2),
+        (unsigned long)GetCurrentThreadId(),g_xbox_kernel_caller,(unsigned)st);
     g_eax = (uint32_t)st;
 }
 
@@ -4426,6 +4626,10 @@ static void bridge_NtCreateSemaphore(void)
         (LONG)STACK_ARG(2), (LONG)STACK_ARG(3));
     if (st >= 0 && handle_va)
         bridge_write_handle(handle_va, h);
+    static volatile LONG shown;
+    if(InterlockedIncrement(&shown)<=32)fprintf(stderr,"[SYNC-CREATE] kind=semaphore slot=%08X token=%08X host=%p initial=%u limit=%u thread=%lu caller=%08X status=%08X\n",
+        handle_va,handle_va?BRIDGE_MEM32(handle_va):0,h,STACK_ARG(2),STACK_ARG(3),
+        (unsigned long)GetCurrentThreadId(),g_xbox_kernel_caller,(unsigned)st);
     g_eax = (uint32_t)st;
 }
 
@@ -6089,16 +6293,15 @@ static void bridge_RtlCaptureStackBackTrace(void)
 typedef struct { uint32_t guest_va; HANDLE host_handle; uint32_t in_use; } KE_SHADOW_SLOT;
 static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
 static CRITICAL_SECTION g_ke_shadow_cs;
-static int g_ke_shadow_init;
+static volatile LONG g_ke_shadow_init;
 
 static void ke_shadow_init(void)
 {
-    if (g_ke_shadow_init)
-        return;
-    InitializeCriticalSection(&g_ke_shadow_cs);
-    /* Wipe any stale pointers from a prior lifecycle (defensive). */
-    memset(g_ke_shadow, 0, sizeof(g_ke_shadow));
-    g_ke_shadow_init = 1;
+    if(InterlockedCompareExchange(&g_ke_shadow_init,1,0)==0) {
+        InitializeCriticalSection(&g_ke_shadow_cs);
+        memset(g_ke_shadow,0,sizeof g_ke_shadow);
+        InterlockedExchange(&g_ke_shadow_init,2);
+    } else while(InterlockedCompareExchange(&g_ke_shadow_init,2,2)!=2) Sleep(0);
 }
 
 /* Insert a mapping guest_va -> host HANDLE. Replaces any prior mapping for
@@ -6259,6 +6462,85 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
                             "(%s)\n", guest_va, *type ? "synchronization" : "notification");
     }
     return h;
+}
+
+/* Used by ordered GPU software-method completion. The same lazy shadow is
+ * used by KeWait/KeSetEvent, so signalling before a wait is not lost. */
+int xbox_KeSignalGuestEvent(uint32_t guest_va)
+{
+    int type;
+    HANDLE event=ke_guest_event(guest_va,&type);
+    if(!event)return 0;
+    BRIDGE_MEM32(guest_va+4)=1;
+    return SetEvent(event)!=0;
+}
+
+/* A title can patch an interrupt NOP after this host's independent FIFO
+ * thread has consumed its placeholder. The completion word remains the
+ * authority: an event is only a wakeup hint. Never invent an interrupt or
+ * advance a fence/GET to release this wait. The subtraction test is the
+ * retail BlockOnTime test, including its unsigned counter wrap behavior. */
+int xbox_KeWaitGuestFence(uint32_t event_va, uint32_t issued_va,
+                        uint32_t completed_va, uint32_t requested)
+{
+    int type;
+    HANDLE event;
+    if ((issued_va & 3u) || (completed_va & 3u) ||
+        !bridge_va_mapped(issued_va,4) || !bridge_va_mapped(completed_va,4))
+        return 0;
+    event=ke_guest_event(event_va,&type);
+    if (!event) return 0;
+    DWORD started=GetTickCount(), reported=started;
+    unsigned timeouts=0,notifications=0;
+    int trace=-1;
+    for (;;) {
+        uint32_t completed=BRIDGE_MEM32(completed_va);
+        uint32_t issued=BRIDGE_MEM32(issued_va);
+        if ((uint32_t)(issued-requested)>=(uint32_t)(issued-completed)) {
+            if (trace>=0) bridge_wait_end(trace);
+            static LONG shown;
+            if ((timeouts || notifications) && InterlockedIncrement(&shown)<=16) {
+                fprintf(stderr,"[GPU-FENCE-WAIT] completed=%08X requested=%08X event=%08X timeouts=%u notifications=%u elapsed_ms=%u\n",
+                        completed,requested,event_va,timeouts,notifications,(unsigned)(GetTickCount()-started));
+            }
+            return 1;
+        }
+        DWORD now=GetTickCount();
+        if (now-reported>=1500u) {
+            reported=now;
+            fprintf(stderr,"[GPU-FENCE-PENDING] issued=%08X completed=%08X requested=%08X counter=%08X event=%08X elapsed_ms=%u\n",
+                    issued,completed,requested,completed_va,event_va,(unsigned)(now-started));
+        }
+        /* Real semaphore publication wakes a host condition directly, so a
+         * late/missed guest interrupt need not wait for a Windows timeout tick.
+         * Rechecking the completion predicate still rejects unrelated wakes. */
+        if(trace<0)trace=bridge_wait_begin(159,event_va,event,0);
+        int changed=xbox_Nv2aWaitFenceChange(completed_va,completed,2);
+        if(changed>0){if(changed==1)++timeouts;else ++notifications;continue;}
+        /* Native condition failure retains V62's completed-fence polling. */
+        /* Honor direct guest header resets just as the ordinary KeWait
+         * bridge does; recheck after ResetEvent to retain a concurrent set. */
+        if (!BRIDGE_MEM32(event_va+4)) {
+            ResetEvent(event);
+            if (BRIDGE_MEM32(event_va+4)) SetEvent(event);
+        } else SetEvent(event);
+        if (trace<0) trace=bridge_wait_begin(159,event_va,event,0);
+        LARGE_INTEGER timeout;
+        timeout.QuadPart=-20000; /* relative 2 ms, then re-read completion */
+        uint32_t status=(uint32_t)xbox_KeWaitForSingleObject(event,6,1,0,&timeout);
+        if (status==0x102u) ++timeouts;
+        else if (status!=0) {
+            bridge_wait_end(trace);
+            fprintf(stderr,"[GPU-FENCE-WAIT] host wait failed status=%08X event=%08X\n",status,event_va);
+            return 0;
+        } else {
+            if(type==1) BRIDGE_MEM32(event_va+4)=0;
+            /* Avoid spinning on an unrelated persistent notification. A
+             * normal completed wakeup returns on the next loop with no sleep. */
+            completed=BRIDGE_MEM32(completed_va);issued=BRIDGE_MEM32(issued_va);
+            if((uint32_t)(issued-requested)<(uint32_t)(issued-completed)) Sleep(1);
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9418,6 +9700,12 @@ static void kernel_thunk_dispatch_body(void)
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
     ULONG ordinal;
+#ifdef _WIN32
+    ULONGLONG call_started;
+    uint32_t call_return_pc;
+    static ULONGLONG trace_started;
+    LONG progress_index = -1;
+#endif
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
@@ -9429,9 +9717,35 @@ static void kernel_thunk_dispatch_body(void)
     ordinal = g_slot_ordinals[slot];
     bridge = g_slot_bridges[slot];
 
+#ifdef _WIN32
+    call_started = GetTickCount64();
+    call_return_pc = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+    if (!trace_started)
+        trace_started = call_started;
+#endif
+
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+#ifdef _WIN32
+    if (!g_kernel_progress_epoch)
+        g_kernel_progress_epoch = call_started;
+    progress_index = InterlockedIncrement(&g_kernel_progress_write) - 1;
+    {
+        KERNEL_PROGRESS_ENTRY *p =
+            &g_kernel_progress[(unsigned)progress_index
+                               & (KERNEL_PROGRESS_SLOTS - 1)];
+        p->sequence = 0;
+        p->started_ms = call_started;
+        p->finished_ms = 0;
+        p->ordinal = ordinal;
+        p->slot = slot;
+        p->caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+        MemoryBarrier();
+        InterlockedExchange64(&p->sequence, (LONG64)g_kernel_call_count);
+    }
+#endif
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -9439,7 +9753,12 @@ static void kernel_thunk_dispatch_body(void)
          * function is calling this" into "this call site is", which is the
          * difference between guessing and knowing when a title recurses. */
         fprintf(stderr,
-                "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                "  [KERNEL] t=%llums #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+#ifdef _WIN32
+                (unsigned long long)(call_started - trace_started),
+#else
+                0ull,
+#endif
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
         fflush(stderr);
@@ -9450,6 +9769,7 @@ static void kernel_thunk_dispatch_body(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+            bridge_wait_dump();
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
@@ -9549,6 +9869,31 @@ static void kernel_thunk_dispatch_body(void)
         g_eax = 0;
     }
 
+#ifdef _WIN32
+    if (progress_index >= 0) {
+        KERNEL_PROGRESS_ENTRY *p =
+            &g_kernel_progress[(unsigned)progress_index
+                               & (KERNEL_PROGRESS_SLOTS - 1)];
+        ULONGLONG finished_ms = GetTickCount64();
+        p->finished_ms = finished_ms;
+        {
+            static RECOMP_TLS int slow_ms = -1;
+            static volatile LONG slow_reports;
+            ULONGLONG elapsed = finished_ms - call_started;
+            if (slow_ms < 0) {
+                const char *e = getenv("RECOMP_KERNEL_SLOW_MS");
+                slow_ms = e ? atoi(e) : 0;
+                if (slow_ms < 0) slow_ms = 0;
+            }
+            if (slow_ms && elapsed >= (ULONGLONG)slow_ms &&
+                    InterlockedIncrement(&slow_reports) <= 64)
+                fprintf(stderr, "[KERNEL-SLOW] ord=%u caller=%08X thread=%lu wall_ms=%llu\n",
+                    ordinal, call_return_pc, (unsigned long)GetCurrentThreadId(),
+                    (unsigned long long)elapsed);
+        }
+    }
+#endif
+
     /* Clean stdcall args from the simulated stack.
      * On real x86, stdcall callee does "ret N" to pop the return address
      * and N bytes of arguments. We already popped the dummy return address
@@ -9567,7 +9912,13 @@ static void kernel_thunk_dispatch_body(void)
     }
 
     if (KERNEL_LOG_ON()) {
+#ifdef _WIN32
+        fprintf(stderr, "  [KERNEL] → returned 0x%08X (bridge %llums)\n",
+                g_eax,
+                (unsigned long long)(GetTickCount64() - call_started));
+#else
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
+#endif
         fflush(stderr);
     }
 }

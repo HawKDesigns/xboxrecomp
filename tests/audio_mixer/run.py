@@ -16,6 +16,7 @@ declarations = core[core.index("static void mixer_init(void);"):
 implementation = core[core.index("static void mixer_init(void)\n{"):]
 source = """
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "platform/xbox_winnt.h"

@@ -124,10 +124,16 @@ static inline void xbox_swizzle_masks(uint32_t width, uint32_t height,
 static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
                                        uint32_t width, uint32_t height)
 {
-    uint32_t mask_x, mask_y;
-
-    xbox_swizzle_masks(width, height, &mask_x, &mask_y);
-    return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
+    /* Power-of-two rectangles interleave the common low bits, then append
+     * the larger coordinate's remaining bits. Avoid rebuilding masks and
+     * depositing bits separately at every sampled/copied pixel. */
+    x &= width - 1u;
+    y &= height - 1u;
+    uint32_t common = width < height ? width : height;
+    uint32_t low = common - 1u;
+    uint32_t high = (width > height ? x : y) & ~low;
+    return swizzle_spread(x & low) | (swizzle_spread(y & low) << 1) |
+           (high * common);
 }
 
 
@@ -347,7 +353,7 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
     uint32_t blocks_per_row = (width + 3u) / 4u;
     const uint8_t *b;
     uint32_t bx = u & 3u, by = v & 3u, texel = by * 4u + bx;
-    uint32_t c[4], idx, alpha = 255u;
+    uint32_t c[4] = {0, 0, 0, 0}, idx, alpha = 255u;
     uint32_t c0, c1, i;
 
     if (!block_bytes || !blocks_per_row)
@@ -412,6 +418,54 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
         alpha = 0;                         /* DXT1's one bit of alpha */
 
     *argb = (alpha << 24) | (c[idx] & 0x00FFFFFFu);
+    return 1;
+}
+
+/* Decode all sixteen texels once per cache miss. Keep the scalar decoder
+ * above as an independent reference and for callers needing just one texel. */
+static inline int d3d8_dxt_decode_block(const uint8_t *block, uint32_t fmt,
+                                       uint32_t pixels[16])
+{
+    uint32_t bytes = d3d8_format_dxt_block_bytes(fmt);
+    const uint8_t *b = block + (bytes == 16 ? 8 : 0);
+    uint32_t c[4] = {0, 0, 0, 0}, alpha[8], c0, c1, selectors, i;
+    uint64_t alpha_bits = 0;
+    if (!bytes) return 0;
+    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+    for (i = 0; i < 2; ++i) {
+        uint32_t rgb = i ? c1 : c0;
+        c[i] = (d3d8_expand_channel((rgb >> 11) & 31, 5) << 16)
+             | (d3d8_expand_channel((rgb >> 5) & 63, 6) << 8)
+             | d3d8_expand_channel(rgb & 31, 5);
+    }
+    for (i = 0; i < 3; ++i) {
+        uint32_t shift = i * 8, a = (c[0] >> shift) & 255, d = (c[1] >> shift) & 255;
+        if (c0 > c1 || bytes == 16) {
+            c[2] |= ((2 * a + d) / 3) << shift;
+            c[3] |= ((a + 2 * d) / 3) << shift;
+        } else c[2] |= ((a + d) / 2) << shift;
+    }
+    if (fmt == 0x0F) {
+        uint32_t a0 = block[0], a1 = block[1];
+        alpha[0] = a0; alpha[1] = a1;
+        if (a0 > a1) {
+            for (i = 1; i < 7; ++i) alpha[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+        } else {
+            for (i = 1; i < 5; ++i) alpha[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+            alpha[6] = 0; alpha[7] = 255;
+        }
+        for (i = 0; i < 6; ++i) alpha_bits |= (uint64_t)block[i + 2] << (8 * i);
+    }
+    selectors = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
+              | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    for (i = 0; i < 16; ++i) {
+        uint32_t index = (selectors >> (2 * i)) & 3, a = 255;
+        if (fmt == 0x0E) a = ((block[i >> 1] >> ((i & 1) * 4)) & 15) * 17;
+        else if (fmt == 0x0F) a = alpha[(alpha_bits >> (3 * i)) & 7];
+        else if (c0 <= c1 && index == 3) a = 0;
+        pixels[i] = (a << 24) | c[index];
+    }
     return 1;
 }
 

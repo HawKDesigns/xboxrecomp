@@ -760,6 +760,11 @@ NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIB
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
+/* Signal a title-built KEVENT by guest VA, sharing the bridge's host shadow. */
+int xbox_KeSignalGuestEvent(uint32_t guest_va);
+int xbox_Nv2aWaitFenceChange(uint32_t completed_va,uint32_t observed,unsigned timeout_ms);
+int xbox_KeWaitGuestFence(uint32_t event_va,uint32_t issued_va,
+                         uint32_t completed_va,uint32_t requested);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 

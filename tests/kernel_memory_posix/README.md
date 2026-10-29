@@ -36,8 +36,11 @@ fixed page size for every pointer.
 
 **`MmGetPhysicalAddress` translates through the contiguous window.** An address
 inside `[XBOX_CONTIG_BASE, XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)` returns its
-physical offset; anything outside passes through unchanged. Both ends of the
-window and both sides of its upper bound are checked. DMA consumers are
+physical offset. Ordinary low RAM receives a bus token with bit 26 set, which
+the APU, GPU and USB strip before accessing low RAM. This distinguishes low
+RAM from an equal offset in the separately stored contiguous window. Other
+addresses pass through unchanged. Both ends of the window and both sides of
+its upper bound are checked. DMA consumers are
 programmed with the result, so a virtual-window address reaching one is not a
 value that faults -- it is one the NV2A reads as a physical address with bit 31
 set.

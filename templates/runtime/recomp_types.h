@@ -78,6 +78,12 @@
  * with STATUS_BREAKPOINT the first time a title tried to print. */
 void recomp_debug_service(uint32_t service, uint32_t arg_va);
 
+/* Full host memory fence used for guest cache-management instructions such
+ * as WBINVD. The host process cannot execute that privileged instruction,
+ * and translated guest memory is already coherent, so only ordering remains
+ * to be preserved. The VA is retained for title-specific diagnostics. */
+void recomp_memory_fence(uint32_t va);
+
 /* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
  * The auto-generated code emits __debugbreak for x86 INT 3 instructions.
  * !defined(__debugbreak) is not enough on its own: MinGW declares __debugbreak
@@ -166,6 +172,10 @@ extern uint32_t g_xbox_code_hi;
 
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+/* Last guest basic block entered by this thread.  Unlike the native program
+ * counter, this remains meaningful to the watchdog while lifted C is running. */
+extern RECOMP_TLS volatile uint32_t g_recomp_pc;
+#define RECOMP_PC(va) (g_recomp_pc = (uint32_t)(va))
 
 /* x87 stack. Per-thread for the same reason the integer registers are:
  * arguments are passed in st(0)/st(1) across call boundaries. */
@@ -1433,5 +1443,16 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * enumerates every site whether or not it is ever reached. */
 void recomp_unimpl(const char *text, uint32_t va);
 #define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
+/* User-mode hosts cannot execute the guest's privileged x86 port-I/O
+ * instructions.  OUT is lifted to these hooks so the runtime can emulate or
+ * explicitly stub the Xbox device register while retaining the source VA for
+ * diagnostics. */
+void recomp_io_out8(uint16_t port, uint8_t value, uint32_t va);
+void recomp_io_out16(uint16_t port, uint16_t value, uint32_t va);
+void recomp_io_out32(uint16_t port, uint32_t value, uint32_t va);
+uint8_t recomp_io_in8(uint16_t port, uint32_t va);
+uint16_t recomp_io_in16(uint16_t port, uint32_t va);
+uint32_t recomp_io_in32(uint16_t port, uint32_t va);
 
 #endif /* RECOMP_TYPES_H */

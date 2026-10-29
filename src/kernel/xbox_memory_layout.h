@@ -174,9 +174,10 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
                            uint32_t src_off, uint32_t dst_off);
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
-/* Advance those counters now, because a swap really completed. Called by the
- * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. */
+/* Associate the registered display clock with a title-built vblank KEVENT. */
+int xbox_Nv2aVblankEvent(uint32_t device_ptr_va,uint32_t event_off);
+/* Refresh elapsed display ticks on FLIP_STALL. Presentation does not add a
+ * vblank or reset the clock phase; display time runs independently of draws. */
 void xbox_Nv2aFrameCounterFlip(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
@@ -191,6 +192,20 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+
+/* A registered software NOP completion, delivered by the executor at its
+ * position in the command stream, after earlier synchronous raster work. */
+int xbox_Nv2aSoftwareEvent(uint32_t device_ptr_va,uint32_t event_off,uint32_t value);
+int xbox_Nv2aHandleSoftwareMethod(uint32_t subchannel,uint32_t value);
+int xbox_Nv2aResolveSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t *address);
+int xbox_Nv2aReleaseResolvedSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t address);
+
+int xbox_Nv2aPushBufferRing(uint32_t device_ptr_va,uint32_t begin_off,uint32_t end_off);
+int xbox_Nv2aCommandFence(uint32_t device_ptr_va,uint32_t pointer_off,uint32_t context,uint32_t bytes);
+int xbox_Nv2aReleaseFence(uint32_t context,uint32_t offset,uint32_t value);
+int xbox_Nv2aResolveFence(uint32_t context,uint32_t offset,uint32_t *address);
+int xbox_Nv2aReleaseResolvedFence(uint32_t context,uint32_t offset,uint32_t address,uint32_t value);
+int xbox_Nv2aFifoRead(uint32_t va,uint32_t *word);
 
 void xbox_MemoryLayoutShutdown(void);
 

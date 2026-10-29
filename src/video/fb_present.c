@@ -25,6 +25,9 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
+/* A user close is terminal for this diagnostic host. Clear/start paths run
+ * throughout guest shutdown and must never recreate a dismissed window. */
+static volatile LONG s_fb_closed;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -40,7 +43,35 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * Two buffers and an index, swapped after the copy completes, so the window
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
+static volatile LONG s_present_init;
+static CRITICAL_SECTION s_present_lock;
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
+/* Two buffers alone do not protect a reader if two flips arrive while it
+ * copies. Hold this lock only for the image copy, never for the GDI blit. */
+static void fb_present_lock(void)
+{
+    if(InterlockedCompareExchange(&s_present_init,1,0)==0) {
+        InitializeCriticalSection(&s_present_lock);
+        InterlockedExchange(&s_present_init,2);
+    } else while(InterlockedCompareExchange(&s_present_init,2,2)!=2) Sleep(0);
+    EnterCriticalSection(&s_present_lock);
+}
+static void fb_present_unlock(void) { LeaveCriticalSection(&s_present_lock); }
+
+void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,uint32_t width,uint32_t height)
+{
+    LONG next;
+    if(!s_fb_running || !pixels || width!=s_fb_width || height!=s_fb_height || getenv("RECOMP_FB_VA"))return;
+    fb_present_lock();
+    next=(s_present_idx==0)?1:0;
+    if(!s_present[next])s_present[next]=(uint32_t*)malloc((size_t)width*height*4);
+    if(s_present[next]) {
+        memcpy(s_present[next],pixels,(size_t)width*height*4);
+        InterlockedExchange(&s_present_idx,next);
+    }
+    fb_present_unlock();
+}
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -66,12 +97,12 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
+    fb_present_lock();
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
         s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
                                              4);
-        if (!s_present[next])
-            return;
+        if (!s_present[next]) { fb_present_unlock(); return; }
     }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
@@ -96,6 +127,22 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    fb_present_unlock();
+}
+
+/* Copy while the producer is excluded; GDI uses this private copy later. */
+static int fb_present_read(uint32_t *dst)
+{
+    int copied=0;
+    if(!dst)return 0;
+    fb_present_lock();
+    LONG idx=s_present_idx;
+    if(idx>=0 && s_present[idx]) {
+        memcpy(dst,s_present[idx],(size_t)s_fb_width*s_fb_height*4);
+        copied=1;
+    }
+    fb_present_unlock();
+    return copied;
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
@@ -140,15 +187,27 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+extern void nv_gpu_capture_request(void);
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        InterlockedExchange(&s_fb_closed, 1);
+        InterlockedExchange(&s_fb_running, 0);
+        fprintf(stderr, "[FBWIN] user closed framebuffer; ending run\n");
+        fflush(stderr);
+        /* The guest can be blocked inside a GPU fence and has no safe
+         * cross-thread unwind. Match the diagnostic watchdog's termination
+         * policy after flushing logs, with a successful user-close status. */
+        TerminateProcess(GetCurrentProcess(), 0);
+        DestroyWindow(h);
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
     case WM_KEYDOWN:
+        if(w==0x77 && !(l & ((LPARAM)1<<30))) {nv_gpu_capture_request();return 0;} /* F8 */
     case WM_SYSKEYDOWN:
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
@@ -310,10 +369,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
-            LONG idx = s_present_idx;
-            if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
+            fb_present_read(s_rgb);
             StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
@@ -381,6 +437,8 @@ void xbox_FramebufferWindowStart(void)
 
     if (!getenv("RECOMP_FB_WINDOW"))
         return;
+    if (InterlockedCompareExchange(&s_fb_closed, 0, 0))
+        return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
@@ -391,6 +449,7 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
+void xbox_FramebufferWindowPresentPixels(const uint32_t *p,uint32_t w,uint32_t h) { (void)p; (void)w; (void)h; }
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}

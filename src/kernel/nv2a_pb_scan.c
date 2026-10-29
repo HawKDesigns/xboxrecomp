@@ -25,6 +25,11 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+#include "nv2a_fifo.h"
 
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
@@ -36,6 +41,10 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static struct { uint32_t method, subch, count; } s_seen[PB_MAX_METHODS];
 static int s_seen_count;
+/* Method packets carry thousands of parameters. Counting each parameter must
+ * not search the growing diagnostic inventory. Preserve its insertion order. */
+static uint16_t s_seen_index[8][2048];
+static int s_inventory_enabled=-1;
 
 /* Parse health. An inventory is only worth reading if the walk stayed in step
  * with the command stream: a decoder that desynchronises produces plausible
@@ -48,11 +57,34 @@ static uint32_t s_tot_calls;
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern uint32_t nv2a_pb_exec_fifo_begin(void);
+extern void nv2a_pb_exec_fifo_end(void);
+extern void nv2a_pb_exec_fifo_end_continue(int);
+extern void nv2a_pb_exec_fifo_idle(void);
+extern void nv2a_pb_exec_guest_access(uint64_t,uint64_t);
 static int s_exec_enabled = -1;
+static int s_fifo_timing=-1;
+static double s_fifo_ms;
+static uint64_t s_fifo_parameters,s_fifo_words,s_fifo_polls;
+static double pb_wall_ms(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER now,frequency;QueryPerformanceCounter(&now);QueryPerformanceFrequency(&frequency);
+    return now.QuadPart*1000.0/frequency.QuadPart;
+#else
+    struct timespec now;timespec_get(&now,TIME_UTC);return now.tv_sec*1000.0+now.tv_nsec/1e6;
+#endif
+}
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
+    if(s_inventory_enabled<0)s_inventory_enabled=getenv("RECOMP_PB_SCAN")!=NULL;
+    if(!s_inventory_enabled)return; /* Detailed inventory is opt-in. */
+    int direct=subch<8 && method<0x2000 && !(method&3);
+    if(direct) {
+        unsigned entry=s_seen_index[subch][method/4];
+        if(entry){++s_seen[entry-1].count;return;}
+    } else for (int i = 0; i < s_seen_count; i++) {
         if (s_seen[i].method == method && s_seen[i].subch == subch) {
             s_seen[i].count++;
             return;
@@ -73,6 +105,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
+        if(direct)s_seen_index[subch][method/4]=(uint16_t)(s_seen_count+1);
         s_seen_count++;
     }
 }
@@ -135,6 +168,9 @@ void nv2a_pb_scan_report(void)
     int i;
 
     if (s_exec_enabled > 0) {
+        if(s_fifo_timing>0)fprintf(stderr,"[GPU-FIFO] execute_ms=%.3f words=%llu parameters=%llu polls=%llu inventory=%d lookup=%s\n",
+            s_fifo_ms,(unsigned long long)s_fifo_words,(unsigned long long)s_fifo_parameters,(unsigned long long)s_fifo_polls,s_seen_count,s_inventory_enabled>0?"direct":"disabled");
+        s_fifo_ms=0;s_fifo_words=s_fifo_parameters=s_fifo_polls=0;
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
     }
@@ -243,3 +279,55 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_jumps += jumps;
     s_tot_segments++;
 }
+
+/* Executed FIFO cursor; unlike a survey range this follows actual control
+ * flow and retains packet parameters across host polls/budget yields. */
+static Nv2aFifo s_fifo;
+static int fifo_read(uint32_t address,uint32_t *word)
+{
+    extern int xbox_Nv2aFifoRead(uint32_t,uint32_t*);
+    /* A command stream can alias a deferred semaphore destination too. */
+    nv2a_pb_exec_guest_access(address,4);
+    return xbox_Nv2aFifoRead(address,word);
+}
+static void fifo_emit(uint32_t subch,uint32_t method,uint32_t param)
+{
+    ++s_fifo_parameters;
+    note(subch,method);nv2a_pb_exec_method(subch,method,param);
+}
+uint32_t nv2a_pb_execute_fifo(uint32_t get,uint32_t put,uint32_t lo,uint32_t hi)
+{
+    if(s_fifo_timing<0){const char *e=getenv("RECOMP_RENDER_TIMING");s_fifo_timing=e && atoi(e)>0;}
+    double begin=s_fifo_timing?pb_wall_ms():0;
+    uint32_t words=s_fifo.words,jumps=s_fifo.jumps,calls=s_fifo.calls;
+    uint32_t budget=nv2a_pb_exec_fifo_begin();
+    uint32_t cursor=nv2a_fifo_run(&s_fifo,get,put,lo,hi,fifo_read,fifo_emit,budget);
+    /* Only a clean continuation may share its completion wait with the next
+     * bounded slice. Empty streams, partial PUTs and decoder errors drain. */
+    nv2a_pb_exec_fifo_end_continue(!s_fifo.error && cursor!=put);
+    if(s_fifo.words>=words)s_tot_words+=s_fifo.words-words;
+    if(s_fifo.words>=words)s_fifo_words+=s_fifo.words-words;
+    if(s_fifo.jumps>=jumps)s_tot_jumps+=s_fifo.jumps-jumps;
+    if(s_fifo.calls>=calls)s_tot_calls+=s_fifo.calls-calls;
+    ++s_tot_segments;s_exec_enabled=1;
+    if(s_fifo.error) {
+        static uint32_t last_bad=~0u;
+        if(last_bad!=cursor) {
+            last_bad=cursor;++s_tot_unknown;
+            fprintf(stderr,"[PB-FIFO] stopped at=%08X word=%08X put=%08X remaining=%u\n",
+                cursor,s_fifo.error_word,put,s_fifo.remaining);
+        }
+    }
+    if(s_fifo_timing){
+        double elapsed=pb_wall_ms()-begin;s_fifo_ms+=elapsed;++s_fifo_polls;
+        static unsigned slow;
+        if(elapsed>=50 && slow++<32)fprintf(stderr,"[GPU-FIFO-SLOW] execute_ms=%.3f words=%u budget=%u cursor=%08X put=%08X remaining=%u method=%04X\n",
+            elapsed,s_fifo.words>=words?s_fifo.words-words:0,budget,cursor,put,s_fifo.remaining,s_fifo.method);
+    }
+    return cursor;
+}
+uint32_t nv2a_pb_fifo_subroutine(void)
+{ return s_fifo.in_call?(s_fifo.return_va&0x0FFFFFFFu)|1u:0; }
+
+/* Called by the owning ACK worker if PUT stops at GET or ring setup vanishes. */
+void nv2a_pb_fifo_idle(void){nv2a_pb_exec_fifo_idle();}

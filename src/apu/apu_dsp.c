@@ -23,6 +23,11 @@
  */
 
 #include "apu_state.h"
+
+MCPXAPUStateLayout mcpx_apu_dsp_state_layout(void)
+{
+    return mcpx_apu_local_state_layout();
+}
 #include "fpconv.h"
 
 #include <stdlib.h>
@@ -198,16 +203,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
-            if (left > 1.0f) left = 1.0f;
-            if (left < -1.0f) left = -1.0f;
-            if (right > 1.0f) right = 1.0f;
-            if (right < -1.0f) right = -1.0f;
-
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
-            d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
-            d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+            /* Preserve headroom for cancellation and the software mixer.
+             * The monitor performs one final linked stereo peak limit. */
+            d->monitor.mix_buf[off + i][0] = left * 32767.0f;
+            d->monitor.mix_buf[off + i][1] = right * 32767.0f;
         }
     }
 

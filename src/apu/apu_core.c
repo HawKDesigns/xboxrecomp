@@ -23,6 +23,8 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "apu_output_limit.h"
+#include "apu_stereo_meter.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
@@ -35,7 +37,7 @@ MCPXAPUState *g_state = NULL;
 
 /* Forward declarations for software mixer */
 static void mixer_init(void);
-static void mixer_render(int16_t frame_buf[][2], int num_samples);
+static void mixer_render(float frame_buf[][2], int num_samples);
 static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
 static CRITICAL_SECTION g_mixer_cs;
@@ -73,9 +75,13 @@ void mcpx_debug_end_frame(void) {}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
+#include "../kernel/xbox_bus_address.h"
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (xbox_bus_is_ram(a))
+        return g_apu_ram_ptr + xbox_bus_ram_address(a);
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
@@ -306,6 +312,7 @@ typedef struct {
     WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
     int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
     int      next_buf;
+    int      fill_samples;
     bool     initialized;
     int      frames_written;
 } WaveOutState;
@@ -351,6 +358,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     }
 
     g_waveout.next_buf = 0;
+    g_waveout.fill_samples = 0;
     g_waveout.initialized = true;
     g_waveout.frames_written = 0;
 
@@ -379,96 +387,120 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
-    if ((d->ep_frame_div + 1) % 8) {
-        return;
+    static uint64_t blocks, nonzero_blocks, submitted_blocks, dropped_blocks;
+    static DWORD last_report;
+    static uint64_t silence_blocks, peak_silence_blocks;
+    static int diag = -1, limit_enabled = -1;
+    static APUOutputLimit limiter;
+    static APUStereoMeter stereo;
+    int peak = 0, submitted = 0;
+    if ((d->ep_frame_div + 1) % 8) return;
+
+    if (diag < 0) diag = getenv("RECOMP_AUDIO_DIAG") != NULL;
+    if (limit_enabled < 0) {
+        const char *e = getenv("RECOMP_AUDIO_LIMITER");
+        limit_enabled = !e || atoi(e) != 0;
+        limiter.gain = 1.0f;
     }
-
-    /* XAudio2 path: render and submit a buffer */
-    if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
-
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
-            }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
-        }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
-        return;
-    }
-
-    if (!g_waveout.initialized) return;
-
-    int idx = g_waveout.next_buf;
-    WAVEHDR *hdr = &g_waveout.hdrs[idx];
-
-    /* Wait if this buffer is still playing (with timeout) */
-    int wait_loops = 0;
-    while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
-        qemu_mutex_unlock(&d->lock);
-        Sleep(1);
-        qemu_mutex_lock(&d->lock);
-        if (++wait_loops > 50) break;
-    }
-
-    /* Fill the large waveOut buffer by rendering multiple 256-sample frames */
-    int16_t *out = (int16_t *)g_waveout.bufs[idx];
-    int remaining = WAVEOUT_BUF_SAMPLES;
-    int out_offset = 0;
-
-    while (remaining > 0) {
-        int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-        /* Test tone (skip if muted) */
-        if (g_test_tone.active && !g_audio_muted) {
-            for (int i = 0; i < chunk; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                d->monitor.frame_buf[i][0] = s;
-                d->monitor.frame_buf[i][1] = s;
+    /* VP/DSP just filled 8 x 32 stereo samples. Preserve that audio and add
+     * software mixer voices to it. Clearing here erased all guest audio. */
+    if (g_audio_muted) {
+        memset(d->monitor.mix_buf, 0, sizeof(d->monitor.mix_buf));
+    } else {
+        if (g_test_tone.active) {
+            for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+                int16_t sample = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.mix_buf[i][0] = sample;
+                d->monitor.mix_buf[i][1] = sample;
                 g_test_tone.phase += g_test_tone.phase_inc;
-                if (g_test_tone.phase >= 2.0 * M_PI)
-                    g_test_tone.phase -= 2.0 * M_PI;
+                if (g_test_tone.phase >= 2.0 * M_PI) g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-
-        /* Mix software voices (skip if muted) */
-        if (!g_audio_muted)
-            mixer_render(d->monitor.frame_buf, chunk);
-
-        /* Copy to waveOut buffer */
-        memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-        out_offset += chunk;
-        remaining -= chunk;
+        mixer_render(d->monitor.mix_buf, MIXER_FRAME_SAMPLES);
     }
-
-    /* Submit to waveOut */
-    hdr->dwFlags &= ~WHDR_DONE;
-    waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
-
-    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
-    g_waveout.frames_written++;
+    apu_output_limit(&limiter, d->monitor.mix_buf, d->monitor.frame_buf,
+                     MIXER_FRAME_SAMPLES, limit_enabled);
+    if (diag) apu_stereo_meter_add(&stereo, d->monitor.frame_buf, MIXER_FRAME_SAMPLES);
+    for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
+        int left = abs((int)d->monitor.frame_buf[i][0]);
+        int right = abs((int)d->monitor.frame_buf[i][1]);
+        if (left > peak) peak = left;
+        if (right > peak) peak = right;
+    }
+    ++blocks;
+    if (peak) {++nonzero_blocks;silence_blocks=0;}
+    else {++silence_blocks;if(silence_blocks>peak_silence_blocks)peak_silence_blocks=silence_blocks;}
+    if (xa2_is_active()) {
+        /* 256 samples per 5.333ms of emulated audio, not 1024 samples made
+         * by repeatedly clearing and re-mixing the same monitor storage. */
+        submitted = xa2_submit_samples((const int16_t *)d->monitor.frame_buf,
+                                       MIXER_FRAME_SAMPLES);
+        if (submitted) ++submitted_blocks;
+        else ++dropped_blocks;
+    } else if (g_waveout.initialized) {
+        int idx = g_waveout.next_buf;
+        WAVEHDR *hdr = &g_waveout.hdrs[idx];
+        if (!g_waveout.fill_samples) {
+            int waits = 0;
+            while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
+                qemu_mutex_unlock(&d->lock);
+                Sleep(1);
+                qemu_mutex_lock(&d->lock);
+                if (++waits > 50) break;
+            }
+        }
+        memcpy(g_waveout.bufs[idx] + g_waveout.fill_samples,
+               d->monitor.frame_buf, sizeof(d->monitor.frame_buf));
+        g_waveout.fill_samples += MIXER_FRAME_SAMPLES;
+        if (g_waveout.fill_samples == WAVEOUT_BUF_SAMPLES) {
+            hdr->dwFlags &= ~WHDR_DONE;
+            waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
+            g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
+            g_waveout.fill_samples = 0;
+            ++g_waveout.frames_written;
+        }
+    }
+    /* Only clear after the completed block has been copied to the backend. */
+    memset(d->monitor.mix_buf, 0, sizeof(d->monitor.mix_buf));
+    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    if (diag) {
+        DWORD now = GetTickCount();
+        if ((DWORD)(now - last_report) >= 5000u) {
+            fprintf(stderr, "[AUDIO-OUTPUT] blocks=%llu nonzero=%llu submitted=%llu dropped=%llu last_peak=%d muted=%d xa2=%d silence_ms=%.1f peak_silence_ms=%.1f\n",
+                    (unsigned long long)blocks, (unsigned long long)nonzero_blocks,
+                    (unsigned long long)submitted_blocks, (unsigned long long)dropped_blocks,
+                    peak, g_audio_muted, xa2_is_active(),
+                    (double)silence_blocks*256000.0/48000.0, (double)peak_silence_blocks*256000.0/48000.0);
+            fprintf(stderr, "[AUDIO-MIX] limiter=%d frames=%llu overload_frames=%llu limited_frames=%llu hard_clipped=%llu nonfinite=%llu input_peak=%.3f gain=%.6f software_voices=%d\n",
+                    limit_enabled, (unsigned long long)limiter.frames,
+                    (unsigned long long)limiter.overload_frames,
+                    (unsigned long long)limiter.limited_frames,
+                    (unsigned long long)limiter.hard_clipped,
+                    (unsigned long long)limiter.nonfinite, limiter.input_peak / 32767.0f,
+                    limiter.gain, (int)g_mixer_active_count);
+            fprintf(stderr,"[AUDIO-STEREO] frames=%llu nonzero_frames=%llu unequal_frames=%llu left_rms=%.6f right_rms=%.6f difference_rms=%.6f similarity=%.6f\n",
+                    (unsigned long long)stereo.frames,
+                    (unsigned long long)stereo.nonzero_frames,
+                    (unsigned long long)stereo.unequal_frames,
+                    apu_stereo_meter_rms(stereo.left_energy,stereo.frames),
+                    apu_stereo_meter_rms(stereo.right_energy,stereo.frames),
+                    apu_stereo_meter_rms(stereo.difference_energy,stereo.frames),
+                    apu_stereo_meter_similarity(&stereo));
+            fprintf(stderr,"[AUDIO-SPATIAL] mono_2d_slices=%llu stereo_2d_slices=%llu filtered_3d_slices=%llu bypass_3d_slices=%llu missing_3d_slices=%llu bins=%u,%u,%u,%u\n",
+                    (unsigned long long)d->vp.stereo.mono_2d,
+                    (unsigned long long)d->vp.stereo.stereo_2d,
+                    (unsigned long long)d->vp.stereo.filtered_3d,
+                    (unsigned long long)d->vp.stereo.bypass_3d,
+                    (unsigned long long)d->vp.stereo.missing_3d,
+                    d->vp.hrtf_submix[0],d->vp.hrtf_submix[1],
+                    d->vp.hrtf_submix[2],d->vp.hrtf_submix[3]);
+            memset(&stereo,0,sizeof stereo);
+            memset(&d->vp.stereo,0,sizeof d->vp.stereo);
+            apu_output_limit_reset_counts(&limiter);
+            peak_silence_blocks=silence_blocks;
+            last_report = now;
+        }
+    }
 }
 
 /* ============================================================
@@ -484,7 +516,7 @@ static void throttle(MCPXAPUState *d)
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 100000) {
         d->next_frame_time_us = now_us;
     }
 
@@ -544,6 +576,11 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    int timing = getenv("RECOMP_AUDIO_DIAG") != NULL;
+    int64_t work_us=0, irq_us=0, peak_us=0, report_us=0;
+    uint64_t subframes=0;
+    /* Keep the 5.33ms audio producer responsive during rendering/asset work. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -565,6 +602,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * whenever FECTL was trapped or halted, and DirectSound then waits
          * forever to post its next command: Burnout 3 stalls in
          * sub_002F805E polling the same doorbell it was acked on at init. */
+        int64_t work_begin = timing ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
         mcpx_apu_dsp_ack_poll(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
@@ -591,7 +629,21 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
+        int64_t irq_begin = timing ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
         apu_deliver_irq(d);
+        if(timing) {
+            int64_t end=qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            int64_t work=irq_begin-work_begin;
+            work_us+=work;irq_us+=end-irq_begin;++subframes;
+            if(work>peak_us)peak_us=work;
+            if(!report_us)report_us=end;
+            if(end-report_us>=5000000) {
+                fprintf(stderr,"[AUDIO-WORK] subframes=%llu span_ms=%.3f pipeline_ms=%.3f irq_ms=%.3f peak_subframe_ms=%.3f\n",
+                        (unsigned long long)subframes,(end-report_us)/1000.0,
+                        work_us/1000.0,irq_us/1000.0,peak_us/1000.0);
+                report_us=end;work_us=irq_us=peak_us=0;subframes=0;
+            }
+        }
 
         /* Let the guest in once per frame.
          *
@@ -655,8 +707,27 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
  * Public API: Init / Shutdown
  * ============================================================ */
 
+bool mcpx_apu_validate_state_layout(void)
+{
+    MCPXAPUStateLayout core = mcpx_apu_local_state_layout();
+    MCPXAPUStateLayout vp = mcpx_apu_vp_state_layout();
+    MCPXAPUStateLayout dsp = mcpx_apu_dsp_state_layout();
+    bool valid = memcmp(&core, &vp, sizeof(core)) == 0 &&
+                 memcmp(&core, &dsp, sizeof(core)) == 0;
+    fprintf(stderr, "[APU-LAYOUT] core=%zu/%zu/%zu vp=%zu/%zu/%zu "
+            "dsp=%zu/%zu/%zu compatible=%d\n",
+            core.size, core.regs, core.monitor, vp.size, vp.regs, vp.monitor,
+            dsp.size, dsp.regs, dsp.monitor, valid);
+    if (!valid)
+        fprintf(stderr, "[APU] Incompatible cached audio objects; rebuild xbox_apu.\n");
+    return valid;
+}
+
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+    /* Check before allocation: a stale core can allocate a smaller state than
+     * newer VP/DSP code uses, and all subsequent register accesses disagree. */
+    if (!mcpx_apu_validate_state_layout()) return NULL;
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -952,7 +1023,7 @@ void apu_mixer_stop(int slot)
 
 /* Mix all active voices into frame_buf. Called from mcpx_apu_monitor_frame.
  * Keep 16 fractional bits in a wide offset so buffers can exceed 65536 frames. */
-static void mixer_render(int16_t frame_buf[][2], int num_samples)
+static void mixer_render(float frame_buf[][2], int num_samples)
 {
     if (!g_mixer_initialized) return;
     EnterCriticalSection(&g_mixer_cs);
@@ -987,23 +1058,18 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
                 }
             }
 
-            int32_t left, right;
+            float left, right;
             if (voice->num_channels >= 2) {
-                left  = (int32_t)(voice->pcm_data[src_frame * 2] * vol);
-                right = (int32_t)(voice->pcm_data[src_frame * 2 + 1] * vol);
+                left  = voice->pcm_data[src_frame * 2] * vol;
+                right = voice->pcm_data[src_frame * 2 + 1] * vol;
             } else {
-                left = right = (int32_t)(voice->pcm_data[src_frame] * vol);
+                left = right = voice->pcm_data[src_frame] * vol;
             }
 
-            /* Accumulate (mix) into frame_buf with clamping */
-            int32_t mixed_l = frame_buf[i][0] + left;
-            int32_t mixed_r = frame_buf[i][1] + right;
-            if (mixed_l > 32767) mixed_l = 32767;
-            if (mixed_l < -32768) mixed_l = -32768;
-            if (mixed_r > 32767) mixed_r = 32767;
-            if (mixed_r < -32768) mixed_r = -32768;
-            frame_buf[i][0] = (int16_t)mixed_l;
-            frame_buf[i][1] = (int16_t)mixed_r;
+            /* Sum before quantization/limiting; opposite-polarity voices
+             * must be allowed to cancel irrespective of their slot order. */
+            frame_buf[i][0] += left;
+            frame_buf[i][1] += right;
 
             pos += inc;
         }

@@ -17,9 +17,9 @@ static IXAudio2MasteringVoice master;
 static IXAudio2SourceVoice source;
 static IXAudio2MasteringVoiceVtbl master_vtable;
 static IXAudio2SourceVoiceVtbl source_vtable;
-static const BYTE *queued[3];
-static BYTE snapshots[3][4096];
-static UINT32 queued_bytes[3], queue_count;
+static const BYTE *queued[6];
+static BYTE snapshots[6][4096];
+static UINT32 queued_bytes[6], queue_count;
 
 #define CHECK(test) do { if (!(test)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #test); failures++; \
@@ -78,8 +78,8 @@ static HRESULT fake_submit(const XAUDIO2_BUFFER *buffer)
 {
     check_queued();
     if (FAILED(submit_result)) return submit_result;
-    CHECK(queue_count < 3);
-    if (queue_count == 3) return E_FAIL;
+    CHECK(queue_count < 6);
+    if (queue_count == 6) return E_FAIL;
     queued[queue_count] = buffer->pAudioData;
     queued_bytes[queue_count] = buffer->AudioBytes;
     memcpy(snapshots[queue_count], buffer->pAudioData, buffer->AudioBytes);
@@ -163,18 +163,20 @@ int main(void)
     submit_result = E_FAIL;
     for (int i = 0; i < 3; i++) {
         memset(samples, 2 + i, sizeof(samples));
-        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == (i == 0));
         CHECK(g_xa2_next_buf == 1 && g_xa2_frames_written == 1);
         check_queued();
     }
     submit_result = S_OK;
-    CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    while(queue_count < XA2_NUM_BUFS)
+        CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    /* A full pending batch is accepted without touching queued slots. */
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 0);
-    CHECK(g_xa2_frames_written == 3);
+    CHECK(g_xa2_frames_written == XA2_NUM_BUFS);
     check_queued();
     /* Complete the oldest buffer, then wrap the ring into that free slot. */
-    for (UINT32 i = 0; i < 2; i++) {
+    for (UINT32 i = 0; i + 1 < queue_count; i++) {
         queued[i] = queued[i + 1];
         queued_bytes[i] = queued_bytes[i + 1];
         memcpy(snapshots[i], snapshots[i + 1], queued_bytes[i]);
@@ -182,6 +184,7 @@ int main(void)
     queue_count--;
     memset(samples, 9, sizeof(samples));
     CHECK(xa2_submit_samples(&samples[0][0], 1024) == 1);
+    CHECK(g_xa2_frames_written == XA2_NUM_BUFS + 1 && queue_count == XA2_NUM_BUFS);
     check_queued();
     xa2_shutdown();
     CHECK(!xa2_is_active() && releases == 1);

@@ -435,7 +435,7 @@ _EFLAGS_PRESERVE = frozenset({
     # pushfd READS the flags and leaves them alone, so it belongs here.
     # popfd does NOT -- see _FLAGS_UNDEFINED.
     "pushfd", "pushal", "pushad", "popal", "popad",
-    "sgdt", "ljmp", "sfence",
+    "sgdt", "ljmp", "sfence", "wbinvd",
     # SSE scalar float
     "movss", "movsd",
     "addss", "subss", "mulss", "divss",
@@ -1399,6 +1399,52 @@ class Lifter:
         if m == "pop":
             return self._lift_pop(insn, ops)
 
+        # CPU port I/O cannot execute directly in a user-mode host process.
+        # Route OUT through a runtime hook so a title can model the relevant
+        # Xbox device register (or deliberately stub it) without issuing the
+        # privileged host instruction.  Keep the guest VA in the call: port
+        # traffic is bring-up-sensitive and an unsupported access must still
+        # be attributable to the exact instruction that made it.
+        if m == "out":
+            if nops != 2:
+                return self._unimplemented(insn, m)
+            port_op, value_op = ops
+            if port_op.type == "reg" and port_op.reg == "dx":
+                port = _fmt_reg(port_op.reg)
+            elif port_op.type == "imm":
+                port = _fmt_imm(port_op.imm & 0xFFFF)
+            else:
+                return self._unimplemented(insn, m)
+            widths = {"al": 8, "ax": 16, "eax": 32}
+            if value_op.type != "reg" or value_op.reg not in widths:
+                return self._unimplemented(insn, m)
+            width = widths[value_op.reg]
+            value = _fmt_reg(value_op.reg)
+            return [
+                f"recomp_io_out{width}((uint16_t)({port}), "
+                f"(uint{width}_t)({value}), 0x{insn.address:08X}u); /* out */"
+            ]
+
+        # IN is the inverse side of the same runtime device hook. Capstone
+        # presents it as destination, port (for example `in al, dx`).
+        if m == "in":
+            if nops != 2:
+                return self._unimplemented(insn, m)
+            value_op, port_op = ops
+            if port_op.type == "reg" and port_op.reg == "dx":
+                port = _fmt_reg(port_op.reg)
+            elif port_op.type == "imm":
+                port = _fmt_imm(port_op.imm & 0xFFFF)
+            else:
+                return self._unimplemented(insn, m)
+            widths = {"al": 8, "ax": 16, "eax": 32}
+            if value_op.type != "reg" or value_op.reg not in widths:
+                return self._unimplemented(insn, m)
+            width = widths[value_op.reg]
+            value = (f"recomp_io_in{width}((uint16_t)({port}), "
+                     f"0x{insn.address:08X}u)")
+            return [_fmt_set_reg(value_op.reg, value) + " /* in */"]
+
         # Save the pre-push ESP in the fifth slot; POPAD discards that
         # slot rather than restoring ESP from memory. Neither changes flags.
         if m in ("pushal", "pushad"):
@@ -1656,6 +1702,16 @@ class Lifter:
         # in the unimplemented report as if they were missing work.
         if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
             return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
+
+        # WBINVD is privileged on the host, but the guest uses it after
+        # writing memory shared with the NV2A. Recompiled memory is already
+        # host-coherent; retain the ordering point as a full runtime fence.
+        # Keeping the guest VA makes hardware bring-up traces attributable.
+        if m == "wbinvd":
+            return [
+                f"recomp_memory_fence(0x{insn.address:08X}u); "
+                "/* wbinvd: host-coherent cache fence */"
+            ]
 
         if m in ("stc", "clc", "cmc"):
             if not self.needs_cf:
@@ -2813,17 +2869,33 @@ class Lifter:
                     "ecx = 0; /* rep stosb */"]
         if "stosd" in m:
             return [
-                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);"
-                " for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;"
-                " edi += ecx * _st; }",
-                "ecx = 0; /* rep stosd */"
+                "{ uint64_t _n = (uint64_t)ecx * 4u;",
+                "if (!g_df && edi < 0xFD000000u"
+                " && (uint64_t)edi + _n <= 0xFD000000u) {",
+                "  uint32_t *_d = (uint32_t*)XBOX_PTR(edi);",
+                "  if (eax == (uint32_t)((uint8_t)eax) * 0x01010101u)"
+                " memset(_d, (uint8_t)eax, (size_t)_n);",
+                "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++) _d[_i] = eax; }",
+                "  edi += (uint32_t)_n;",
+                "} else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);",
+                "  for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = eax;",
+                "  edi += ecx * _st; }",
+                "ecx = 0; } /* rep stosd */"
             ]
         if "stosw" in m:
             return [
-                "{ uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);"
-                " for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);"
-                " edi += ecx * _st; }",
-                "ecx = 0; /* rep stosw */"
+                "{ uint64_t _n = (uint64_t)ecx * 2u;",
+                "if (!g_df && edi < 0xFD000000u"
+                " && (uint64_t)edi + _n <= 0xFD000000u) {",
+                "  uint16_t *_d = (uint16_t*)XBOX_PTR(edi); uint16_t _v = LO16(eax);",
+                "  if (_v == (uint16_t)((uint8_t)_v) * 0x0101u)"
+                " memset(_d, (uint8_t)_v, (size_t)_n);",
+                "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++) _d[_i] = _v; }",
+                "  edi += (uint32_t)_n;",
+                "} else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(2);",
+                "  for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*_st) = LO16(eax);",
+                "  edi += ecx * _st; }",
+                "ecx = 0; } /* rep stosw */"
             ]
         if "cmpsb" in m:
             return self._rep_compare(m, "MEM8(esi)", "MEM8(edi)", 1, True)

@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "main_pc_samples.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -587,6 +588,163 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
             device_ptr_va, put_off, get_ptr_off);
     return 0;
 }
+/* Command-backed fences replace title-specific timer mirrors. QPR2 creates
+ * DMA context 8 over the first 0x20 bytes at device+30 (198FBB..198FE2). */
+#define XBOX_MAX_COMMAND_FENCES 4
+#include "kernel/nv2a_fence_signal.h"
+static NvFenceSignal g_command_fence_signal=NV_FENCE_SIGNAL_INIT;
+/* Acquire the same lock as completion publication, recheck, then atomically
+ * release/sleep. Completion before registration or during sleep cannot be lost.
+ * 2 = changed/woken, 1 = timeout recheck, 0 = invalid/native failure fallback. */
+int xbox_Nv2aWaitFenceChange(uint32_t address,uint32_t observed,unsigned timeout_ms)
+{
+    if((address&3) || !fence_readable(address,4))return 0;
+    volatile LONG *word=(volatile LONG*)((uintptr_t)address+g_memory_offset);
+    nv_fence_signal_lock(&g_command_fence_signal);
+    int result=2;
+    if((uint32_t)InterlockedCompareExchange(word,0,0)==observed)
+        result=nv_fence_signal_sleep(&g_command_fence_signal,timeout_ms);
+    nv_fence_signal_unlock(&g_command_fence_signal);return result;
+}
+extern void nv2a_pb_exec_guest_access(uint64_t address,uint64_t bytes);
+static struct { uint32_t device_ptr_va,pointer_off,context,bytes; unsigned releases; }
+    g_command_fences[XBOX_MAX_COMMAND_FENCES];
+static unsigned g_command_fence_count;
+int xbox_Nv2aCommandFence(uint32_t device_ptr_va,uint32_t pointer_off,uint32_t context,uint32_t bytes)
+{
+    if(g_command_fence_count==XBOX_MAX_COMMAND_FENCES || bytes<4)return -1;
+    g_command_fences[g_command_fence_count].device_ptr_va=device_ptr_va;
+    g_command_fences[g_command_fence_count].pointer_off=pointer_off;
+    g_command_fences[g_command_fence_count].context=context;
+    g_command_fences[g_command_fence_count].bytes=bytes;++g_command_fence_count;
+    fprintf(stderr,"[GPU-FENCE] registered device=%08X pointer_offset=%X context=%u bytes=%u\n",
+        device_ptr_va,pointer_off,context,bytes);return 0;
+}
+int xbox_Nv2aResolveFence(uint32_t context,uint32_t offset,uint32_t *address)
+{
+    if(!address)return 0;
+    for(unsigned i=0;i<g_command_fence_count;i++) {
+        uint32_t dev,base,target;
+        if(context!=g_command_fences[i].context)continue;
+        if((offset&3) || offset>g_command_fences[i].bytes-4)return 0;
+        if(!fence_readable(g_command_fences[i].device_ptr_va,4))return 0;
+        nv2a_pb_exec_guest_access(g_command_fences[i].device_ptr_va,4);
+        dev=*(volatile uint32_t*)((uintptr_t)g_command_fences[i].device_ptr_va+g_memory_offset);
+        if(!dev || dev>UINT32_MAX-g_command_fences[i].pointer_off ||
+            !fence_readable(dev+g_command_fences[i].pointer_off,4))return 0;
+        nv2a_pb_exec_guest_access(dev+g_command_fences[i].pointer_off,4);
+        base=*(volatile uint32_t*)((uintptr_t)(dev+g_command_fences[i].pointer_off)+g_memory_offset);
+        if(!base || base>UINT32_MAX-offset)return 0;target=base+offset;
+        if((target&3) || !fence_readable(target,4))return 0;
+        *address=target;return 1;
+    }
+    return 0;
+}
+/* The destination is captured when the command is consumed. A later device
+ * pointer change must not redirect a completion already in flight. */
+int xbox_Nv2aReleaseResolvedFence(uint32_t context,uint32_t offset,uint32_t address,uint32_t value)
+{
+    if((address&3) || !fence_readable(address,4))return 0;
+    for(unsigned i=0;i<g_command_fence_count;i++) {
+        if(context!=g_command_fences[i].context)continue;
+        if((offset&3) || offset>g_command_fences[i].bytes-4)return 0;
+        nv_fence_signal_lock(&g_command_fence_signal);
+        InterlockedExchange((volatile LONG*)((uintptr_t)address+g_memory_offset),(LONG)value);
+        nv_fence_signal_wake(&g_command_fence_signal);
+        nv_fence_signal_unlock(&g_command_fence_signal);
+        unsigned n=++g_command_fences[i].releases;
+        if(n<=4 || !(n&(n-1)))fprintf(stderr,"[GPU-FENCE] released context=%u offset=%u value=%u count=%u\n",context,offset,value,n);
+        return 1;
+    }
+    return 0;
+}
+int xbox_Nv2aReleaseFence(uint32_t context,uint32_t offset,uint32_t value)
+{
+    uint32_t address;
+    return xbox_Nv2aResolveFence(context,offset,&address) &&
+        xbox_Nv2aReleaseResolvedFence(context,offset,address,value);
+}
+static struct { uint32_t device_ptr_va,begin_off,end_off; } g_fifo_ring;
+int xbox_Nv2aPushBufferRing(uint32_t device_ptr_va,uint32_t begin_off,uint32_t end_off)
+{
+    g_fifo_ring.device_ptr_va=device_ptr_va;g_fifo_ring.begin_off=begin_off;g_fifo_ring.end_off=end_off;
+    fprintf(stderr,"[PB-FIFO] registered device=%08X bounds=+%X/+%X\n",device_ptr_va,begin_off,end_off);return 0;
+}
+static int fifo_ring_bounds(uint32_t *lo,uint32_t *hi)
+{
+    uint32_t dev;
+    if(!g_fifo_ring.device_ptr_va || !fence_readable(g_fifo_ring.device_ptr_va,4))return 0;
+    dev=*(volatile uint32_t*)((uintptr_t)g_fifo_ring.device_ptr_va+g_memory_offset);
+    if(!dev || dev>UINT32_MAX-g_fifo_ring.begin_off || dev>UINT32_MAX-g_fifo_ring.end_off ||
+       !fence_readable(dev+g_fifo_ring.begin_off,4) || !fence_readable(dev+g_fifo_ring.end_off,4))return 0;
+    *lo=*(volatile uint32_t*)((uintptr_t)(dev+g_fifo_ring.begin_off)+g_memory_offset);
+    *hi=*(volatile uint32_t*)((uintptr_t)(dev+g_fifo_ring.end_off)+g_memory_offset);
+    return *lo>=XBOX_CONTIG_BASE && *hi>*lo && !((*lo|*hi)&3) &&
+           *hi-*lo<=0x400000u && fence_readable(*lo,*hi-*lo);
+}
+
+/* Retail QPR2 196D82 submits NOP value 5; 19B5C9 signals miniport+1A4.
+ * Registration keeps title-specific offsets out of the generic executor. */
+#define XBOX_MAX_SOFTWARE_EVENTS 4
+extern void nv2a_pb_exec_completion_access(uint64_t address,uint64_t bytes);
+static struct { uint32_t device_ptr_va,event_off,value; unsigned signals; }
+    g_software_events[XBOX_MAX_SOFTWARE_EVENTS];
+static unsigned g_software_event_count;
+int xbox_Nv2aSoftwareEvent(uint32_t device_ptr_va,uint32_t event_off,uint32_t value)
+{
+    if(g_software_event_count==XBOX_MAX_SOFTWARE_EVENTS)return -1;
+    g_software_events[g_software_event_count].device_ptr_va=device_ptr_va;
+    g_software_events[g_software_event_count].event_off=event_off;
+    g_software_events[g_software_event_count].value=value;
+    ++g_software_event_count;
+    fprintf(stderr,"[GPU-EVENT] registered device=%08X event_offset=%X NOP=%u\n",
+        device_ptr_va,event_off,value);
+    return 0;
+}
+/* Capture the destination when the GPU command is consumed. Completion may
+ * be delayed, but a later device-pointer change must not redirect it. Unlike
+ * surface binding, these are actual CPU reads and require current target
+ * contents too if a deliberately overlapping GPU output supplied the chain. */
+int xbox_Nv2aResolveSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t *address)
+{
+    if(subchannel!=0 || !address)return 0;
+    for(unsigned i=0;i<g_software_event_count;i++) {
+        uint32_t dev,event;
+        if(value!=g_software_events[i].value)continue;
+        if(!fence_readable(g_software_events[i].device_ptr_va,4))return 0;
+        nv2a_pb_exec_completion_access(g_software_events[i].device_ptr_va,4);
+        dev=*(volatile uint32_t*)((uintptr_t)g_software_events[i].device_ptr_va+g_memory_offset);
+        if(!dev || dev>UINT32_MAX-g_software_events[i].event_off)return 0;
+        event=dev+g_software_events[i].event_off;
+        if(!fence_readable(event,16))return 0;
+        *address=event;return 1;
+    }
+    return 0;
+}
+int xbox_Nv2aReleaseResolvedSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t event)
+{
+    if(subchannel!=0 || !fence_readable(event,16))return 0;
+    for(unsigned i=0;i<g_software_event_count;i++) {
+        if(value!=g_software_events[i].value)continue;
+        if(!xbox_KeSignalGuestEvent(event)) {
+            static unsigned failed;
+            if(failed++<8)fprintf(stderr,"[GPU-EVENT] could not signal event=%08X header=%08X\n",
+                event,*(volatile uint32_t*)((uintptr_t)event+g_memory_offset));
+            return 0;
+        }
+        unsigned n=++g_software_events[i].signals;
+        if(n<=8 || !(n&(n-1)))fprintf(stderr,"[GPU-EVENT] completed NOP=%u event=%08X count=%u\n",value,event,n);
+        return 1;
+    }
+    return 0;
+}
+int xbox_Nv2aHandleSoftwareMethod(uint32_t subchannel,uint32_t value)
+{
+    uint32_t event;
+    return xbox_Nv2aResolveSoftwareEvent(subchannel,value,&event) &&
+        xbox_Nv2aReleaseResolvedSoftwareEvent(subchannel,value,event);
+}
+
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
  * have built it yet. */
@@ -608,6 +766,12 @@ static int fence_readable(uint32_t va, uint32_t bytes)
             && (uint64_t)va + bytes <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return g_contig_memory != NULL;
     return (size_t)va + bytes <= g_memory_size;
+}
+
+int xbox_Nv2aFifoRead(uint32_t va,uint32_t *word)
+{
+    if(!word || (va&3) || !fence_readable(va,4))return 0;
+    *word=*(volatile uint32_t*)((uintptr_t)va+g_memory_offset);return 1;
 }
 
 /*
@@ -683,110 +847,135 @@ static void counter_mirrors_tick(void)
 }
 
 /*
- * Frame counters the title polls to pace itself.
- *
- * D3D keeps a swap count inside the device and bumps it once per presented
- * frame; a title that wants to wait a frame reads it and spins until it moves.
- * Wreckless does exactly that at guest 0x000DC5E0 -- "loop while the counter
- * has advanced by less than 2" -- so a counter that never moves is not a
- * dropped frame, it is a hang with a full asset load behind it.
- *
- * Nothing here presents, so nothing would ever move it. Advancing it on a
- * clock is what makes the wait terminate, and 60 Hz is the rate the title
- * expects the display to run at. Followed through the device pointer for the
- * same reason the fence is: the device is allocated at runtime.
+ * Display counters the title polls for XMV frame deadlines. The display
+ * clock runs independently of draw submissions. Accumulate every elapsed
+ * tick, including those that pass while the scan thread is busy rendering.
  */
 #define XBOX_MAX_FRAME_COUNTERS 4
-#define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
+#include "xbox_frame_clock.h"
 
 static struct {
     uint32_t device_ptr_va;
     uint32_t counter_off;
+    uint32_t last_device;
+    uint32_t event_off;
+    uint64_t event_signals;
+    XBOX_FRAME_CLOCK clock;
 } g_frame_counters[XBOX_MAX_FRAME_COUNTERS];
-static int   g_frame_counter_count = 0;
-static DWORD g_frame_counter_last_ms = 0;
+static int g_frame_counter_count = 0;
+static LARGE_INTEGER g_frame_clock_frequency;
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
 {
+    /* Both addresses identify 32-bit guest fields. A one-byte registration
+     * error advances the reader's neighboring DWORD by 256 per display tick
+     * and also creates an unaligned native access. Reject it before use. */
+    if ((device_ptr_va & 3u) || (counter_off & 3u)) {
+        fprintf(stderr,"[FRAME-CLOCK] rejected unaligned registration device=%08X counter_offset=%X\n",device_ptr_va,counter_off);
+        return -1;
+    }
     if (g_frame_counter_count >= XBOX_MAX_FRAME_COUNTERS)
         return -1;
+    /* Registration happens before guest device creation. QPC avoids the
+     * coarse GetTickCount timebase and keeps rendering out of clock timing. */
+    if (!g_frame_clock_frequency.QuadPart)
+        QueryPerformanceFrequency(&g_frame_clock_frequency);
     g_frame_counters[g_frame_counter_count].device_ptr_va = device_ptr_va;
-    g_frame_counters[g_frame_counter_count].counter_off   = counter_off;
+    g_frame_counters[g_frame_counter_count].counter_off = counter_off;
     g_frame_counter_count++;
-    fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X @ %d Hz\n",
-            device_ptr_va, counter_off, 1000 / XBOX_FRAME_PERIOD_MS);
+    fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X @ display rate (50/59.94 Hz, elapsed QPC ticks)\n",
+            device_ptr_va, counter_off);
     return 0;
 }
 
-/* A real swap happened: advance every registered counter, and remember when.
- *
- * The timer below exists for a title nothing presents for. Once the
- * pushbuffer executor is actually running flips, the timer is the wrong
- * clock and an actively harmful one: Half-Life 2's loader paces its intro on
- * this count, so a 62 Hz timer against an executor managing a fraction of a
- * frame per second ran the video forward in virtual time far faster than it
- * could be drawn. Only every few hundredth frame was ever presented, each one
- * sampled part way through its own decode -- which looks exactly like a
- * stalling, blocky video rather than a clock running away.
- */
-static DWORD g_frame_counter_flip_ms;
-
-void xbox_Nv2aFrameCounterFlip(void)
+/* Same display clock drives the event awaited by retail mode setup. The
+ * miniport vblank ISR (QPR2 19AFD1) signals miniport+194 = device+1954. */
+int xbox_Nv2aVblankEvent(uint32_t device_ptr_va,uint32_t event_off)
 {
-    int i;
-
-    g_frame_counter_flip_ms = GetTickCount();
-    if (!g_frame_counter_flip_ms)
-        g_frame_counter_flip_ms = 1;          /* 0 means "never" */
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
+    for(int i=0;i<g_frame_counter_count;i++) {
+        if(g_frame_counters[i].device_ptr_va!=device_ptr_va)continue;
+        g_frame_counters[i].event_off=event_off;
+        fprintf(stderr,"[VBLANK-EVENT] registered device=%08X event_offset=%X\n",device_ptr_va,event_off);
+        return 0;
     }
+    return -1;
+}
+
+static uint64_t frame_clock_us(void)
+{
+    LARGE_INTEGER now;
+    uint64_t ticks, hz;
+    QueryPerformanceCounter(&now);
+    ticks = (uint64_t)now.QuadPart;
+    hz = (uint64_t)g_frame_clock_frequency.QuadPart;
+    if (!hz) return 0;
+    return (ticks / hz) * 1000000ull + ((ticks % hz) * 1000000ull) / hz;
 }
 
 static void frame_counters_tick(void)
 {
-    DWORD now = GetTickCount();
+    uint64_t now;
     int i;
-
-    if (!g_frame_counter_count)
-        return;
-    if (g_frame_counter_last_ms
-            && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
-        return;
-    /* Something is presenting: let it drive the count instead. Two seconds,
-     * because the executor's flips are not evenly spaced and a title that
-     * genuinely stops presenting still has to be got moving again. */
-    if (g_frame_counter_flip_ms && (now - g_frame_counter_flip_ms) < 2000) {
-        g_frame_counter_last_ms = now;
-        return;
-    }
-    g_frame_counter_last_ms = now;
-
+    if (!g_frame_counter_count) return;
+    now = frame_clock_us();
     for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
+        uint32_t dev, lo, hi, refresh;
+        uint64_t elapsed_frames;
+        volatile uint32_t *counter;
+        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4)) continue;
         dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
                                      + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
+        if (!dev || !fence_readable(dev + g_frame_counters[i].counter_off, 4)
+                 || !fence_readable(dev + 0x1974u, 4)
+                 || !fence_readable(dev + 0x1FE0u, 8)) continue;
+        if (dev != g_frame_counters[i].last_device) {
+            memset(&g_frame_counters[i].clock, 0, sizeof(XBOX_FRAME_CLOCK));
+            g_frame_counters[i].last_device = dev;
+        }
+        /* Match the refresh selection in retail D3D GetDisplayMode (QPR2
+         * 00195A50). NTSC uses 16.683 ms, PAL uses 20 ms in XMV. */
+        lo = *(volatile uint32_t *)((uintptr_t)(dev + 0x1FE0u) + g_memory_offset);
+        hi = *(volatile uint32_t *)((uintptr_t)(dev + 0x1FE4u) + g_memory_offset);
+        if (lo || hi)
+            refresh = (lo == 0x01312D00u && hi == 0) ? 50u : 60u;
+        else
+            refresh = (*(volatile uint32_t *)((uintptr_t)(dev + 0x1974u)
+                         + g_memory_offset) & 0x00400000u) ? 60u : 50u;
+        elapsed_frames = xbox_frame_clock_advance(&g_frame_counters[i].clock,
+                                                 now, refresh);
+        counter = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                                       + g_memory_offset);
+        *counter += (uint32_t)elapsed_frames;
+        /* A delayed poll advances all missed display ticks, but a notification
+         * KEVENT holds one signal until reset. Never signal on registration,
+         * a flip alone, or a poll where no display period elapsed. */
+        if(elapsed_frames && g_frame_counters[i].event_off &&
+                dev<=UINT32_MAX-g_frame_counters[i].event_off) {
+            uint32_t event=dev+g_frame_counters[i].event_off;
+            if(fence_readable(event,16) && xbox_KeSignalGuestEvent(event)) {
+                uint64_t n=++g_frame_counters[i].event_signals;
+                if(n<=4 || !(n&(n-1)))fprintf(stderr,
+                    "[VBLANK-EVENT] signaled event=%08X ticks=%llu count=%llu\n",
+                    event,(unsigned long long)elapsed_frames,(unsigned long long)n);
+            }
+        }
     }
+}
+
+void xbox_Nv2aFrameCounterFlip(void)
+{
+    /* Refresh elapsed vblanks at presentation, too. A flip is not an extra
+     * vblank and must neither increment the count nor reset its phase. */
+    frame_counters_tick();
 }
 
 static void fence_mirrors_tick(void)
 {
+    static int trace = -1;
+    static unsigned traced[XBOX_MAX_FENCE_MIRRORS];
+
+    if (trace < 0)
+        trace = getenv("RECOMP_FENCE_TRACE") != NULL;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -807,8 +996,16 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
+            if (*fence != put) {
+                uint32_t before = *fence;
                 *fence = put;
+                if (trace && traced[i]++ < 16) {
+                    fprintf(stderr,
+                            "  [NV2A] fence mirror %d: 0x%08X %u -> %u\n",
+                            i, get_ptr, before, put);
+                    fflush(stderr);
+                }
+            }
         }
     }
 }
@@ -931,7 +1128,36 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            uint32_t ring_lo,ring_hi;
+            static int fifo_exec=-1;
+            if(fifo_exec<0)fifo_exec=getenv("RECOMP_PB_EXEC")!=NULL;
+            if(g_fifo_ring.device_ptr_va && fifo_exec) {
+                if(fifo_ring_bounds(&ring_lo,&ring_hi)) {
+                    extern uint32_t nv2a_pb_execute_fifo(uint32_t,uint32_t,uint32_t,uint32_t);
+                    extern uint32_t nv2a_pb_fifo_subroutine(void);
+                    extern void nv2a_pb_scan_report(void);
+                    volatile uint32_t *get=(volatile uint32_t*)((char*)regs+NV2A_USER_DMA_GET);
+                    uint32_t cursor=XBOX_CONTIG_BASE|(*get&0x0FFFFFFFu);
+                    uint32_t target=XBOX_CONTIG_BASE|(put&0x0FFFFFFFu);
+                    /* D3D publishes the ring's initial GET during setup. */
+                    if(!*get)cursor=ring_lo;
+                    extern void nv2a_pb_fifo_idle(void);
+                    if(cursor!=target || nv2a_pb_fifo_subroutine())cursor=nv2a_pb_execute_fifo(cursor,target,ring_lo,ring_hi);
+                    else nv2a_pb_fifo_idle();
+                    *get=cursor&0x0FFFFFFFu;
+                    *(volatile uint32_t*)((char*)regs+NV2A_PFIFO_DMA_GET)=*get;
+                    *(volatile uint32_t*)((char*)regs+NV2A_PFIFO_DMA_SUBROUTINE)=nv2a_pb_fifo_subroutine();
+                    static DWORD reported;
+                    static long report_ms=-1;
+                    if(report_ms<0){const char *e=getenv("RECOMP_PB_REPORT_MS");report_ms=e?atol(e):10000;if(report_ms<100)report_ms=100;}
+                    if(now_ms-reported>(DWORD)report_ms) {
+                        reported=now_ms;nv2a_pb_scan_report();
+                        fprintf(stderr,"[PB-FIFO] PUT=%08X GET=%08X ring=%08X..%08X\n",put,*get,ring_lo,ring_hi);
+                    }
+                } else {
+                    extern void nv2a_pb_fifo_idle(void);nv2a_pb_fifo_idle();
+                }
+            } else if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
@@ -1059,6 +1285,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
+    { extern void nv2a_pb_fifo_idle(void);nv2a_pb_fifo_idle(); }
     return 0;
 }
 
@@ -1113,6 +1340,7 @@ static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+RECOMP_TLS volatile uint32_t g_recomp_pc = 0;
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1269,8 +1497,11 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
+extern void xbox_KernelProgressDump(void);
+extern void xbox_KernelWaitDump(void);
 
 static uint32_t *s_watchdog_esp;
+static volatile uint32_t *s_watchdog_pc;
 /* The other guest registers are thread-local too, so the watchdog has to be
  * handed the guest thread's copies rather than reading its own -- which are
  * always zero, and read as "every register is null" at exactly the moment the
@@ -1579,19 +1810,54 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
+/* Sample the registered main thread's PC without adding work to its guest
+ * instruction path. Unlike a single watchdog snapshot, a window identifies
+ * where multi-second frame gaps spend their time. */
+static void xbox_watchdog_wait(void)
+{
+    const char *enabled = getenv("RECOMP_MAIN_SAMPLES");
+    ULONGLONG started, now;
+    XboxMainPcSamples samples = {0};
+    if (!enabled || !*enabled || *enabled == '0') {
+        Sleep(s_watchdog_secs * 1000u);
+        return;
+    }
+    started = GetTickCount64();
+    do {
+        Sleep(250);
+        xbox_main_sample_add(&samples, s_watchdog_pc ? *s_watchdog_pc : 0);
+        now = GetTickCount64();
+        if (samples.total == XBOX_MAIN_SAMPLE_COUNT) {
+            uint32_t shown = 0;
+            fprintf(stderr, "[MAIN-SAMPLES] t_ms=%llu samples=%u esp=%08X",
+                (unsigned long long)(now - started), samples.total,
+                s_watchdog_esp ? *s_watchdog_esp : 0);
+            for (unsigned rank = 0; rank < 4; ++rank) {
+                int best = xbox_main_sample_best(&samples, shown);
+                if (best < 0) break;
+                fprintf(stderr, " pc=%08X:%u", samples.pc[best], samples.hits[best]);
+                shown |= 1u << best;
+            }
+            fputc('\n', stderr);
+            xbox_KernelWaitDump();
+            memset(&samples, 0, sizeof samples);
+        }
+    } while (now - started < (ULONGLONG)s_watchdog_secs * 1000u);
+}
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     const uint8_t *mem;
     uint32_t esp, i;
 
     (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
+    xbox_watchdog_wait();
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
+    fprintf(stderr, "[WATCHDOG] no exit after %us; guest pc=0x%08X esp=0x%08X\n"
             "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
+            s_watchdog_secs, s_watchdog_pc ? *s_watchdog_pc : 0, esp,
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
             s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
             s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
@@ -1614,6 +1880,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
     }
+    xbox_KernelProgressDump();
     /* Guest globals worth seeing at the moment of the hang.
      *
      * RECOMP_PEEK is otherwise only sampled by the pushbuffer reporter, which
@@ -1647,14 +1914,22 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 #undef WD_NV2A
     }
 
-    for (i = 0; i < 400 && esp; i++) {
+    /* A short stack tail is enough to identify the guest frame. Keeping this
+     * bounded also prevents redirected stderr from delaying termination while
+     * the guest continues to run and interleaves more output. */
+    for (i = 0; i < 64 && esp; i++) {
         uint32_t a = esp + i * 4;
         if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
-    _exit(3);
+    /* Do not run CRT or DLL shutdown from a watchdog thread: either can wait
+     * on a lock held by the guest and leave the process alive after the log
+     * says the watchdog fired. TerminateProcess is intentional here because
+     * this path exists only for diagnostic runs. */
+    TerminateProcess(GetCurrentProcess(), 3);
+    _exit(3); /* fallback if termination could not be requested */
     return 0;
 }
 
@@ -1673,6 +1948,7 @@ void xbox_WatchdogStart(void)
      * be handed the address of the one that matters rather than reading its
      * own, which is always zero. */
     s_watchdog_esp = &g_esp;
+    s_watchdog_pc = &g_recomp_pc;
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;

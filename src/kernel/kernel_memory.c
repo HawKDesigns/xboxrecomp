@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_bus_address.h"
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -165,23 +166,12 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
 
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
-    /*
-     * The contiguous arena is the virtual window onto physical RAM, so an
-     * address inside it is its physical offset plus XBOX_CONTIG_BASE. Anything
-     * outside passes through unchanged.
-     *
-     * The only implementation. bridge_MmGetPhysicalAddress calls this rather
-     * than repeating the arithmetic: the two used to disagree, with the bridge
-     * translating and this returning its argument unchanged as a placeholder,
-     * so the answer a title got depended on which dispatch path it took. A
-     * title writes the result into a pushbuffer, the NV2A reads an address
-     * with bit 31 set, and the corruption surfaces as wrong geometry with
-     * nothing naming this function.
-     */
+    /* Contiguous window offsets and ordinary low-RAM offsets name separate
+     * host storage. Encode ordinary pages distinctly so every bus master
+     * can reach the CPU's actual bytes after the contiguous arena grows.
+     * The guest bridge delegates here too, keeping both paths identical. */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    return (ULONG_PTR)xbox_bus_encode(va);
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

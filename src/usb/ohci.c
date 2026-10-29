@@ -171,6 +171,43 @@ static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
+/* Pads plugged in so far, in port order.  This is controller state rather
+ * than worker-thread state: the title can put the controller into Operational
+ * and enable RHSC between two worker ticks, and that write is the first safe
+ * instant at which the device can arrive. */
+static int s_plugged_pads;
+static unsigned s_first_pad_port;
+
+static int ohci_attach_first_pad(OhciController *hc, unsigned waited_ms)
+{
+    const char *pspec;
+    unsigned port;
+
+    if (!hc || hc->index != s_device_hc || s_npads < 1 || s_plugged_pads)
+        return 0;
+    if ((hc->reg[HcControl / 4] & 0xC0u) != 0x80u)
+        return 0;
+    if ((hc->reg[HcInterruptEnable / 4] & (INTR_MIE | INTR_RHSC))
+            != (INTR_MIE | INTR_RHSC))
+        return 0;
+
+    pspec = getenv("RECOMP_USB_PORT");
+    port = pspec ? (unsigned)atoi(pspec) : 0u;
+    if (s_ndp == 0)
+        return 0;
+    if (port >= s_ndp)
+        port = s_ndp - 1u;
+
+    hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+    hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+    s_first_pad_port = port;
+    s_plugged_pads = 1;
+    fprintf(stderr, "  [OHCI%d] operational after %u ms; virtual pad "
+                    "arriving on port %u\n",
+            hc->index, waited_ms, port + 1u);
+    fflush(stderr);
+    return 1;
+}
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -273,6 +310,12 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 
     case HcInterruptEnable:
         hc->reg[HcInterruptEnable / 4] |= v;
+        /* Do this synchronously with the driver's enable.  QPR2 transitions
+         * HcControl away from Operational before the 4 ms worker can observe
+         * the state, so worker-only attachment loses the one enumeration
+         * window and leaves every port looking empty forever.  No ISR is
+         * called on the guest thread here; the worker still owns delivery. */
+        ohci_attach_first_pad(hc, 0);
         return;
 
     case HcInterruptDisable:
@@ -418,9 +461,6 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 #define g_ctrl_len  g_ctrl_len_[pad]
 #define g_ctrl_sent g_ctrl_sent_[pad]
 
-/* Pads plugged in so far, in port order. */
-static int s_plugged_pads;
-
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
  * is the plugged pad that has not been given one yet. Pads are plugged one
@@ -496,8 +536,10 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
+#include "../kernel/xbox_bus_address.h"
 static uint32_t bus_resolve(uint32_t addr)
 {
+    if (xbox_bus_is_ram(addr)) return xbox_bus_ram_address(addr);
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
@@ -1013,7 +1055,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     unsigned held_off = 0;
     int      held_off_warned = 0, held_off_forced = 0;
     unsigned last_ack = 0;
-    unsigned first_port = 0, settle = 0;
+    unsigned settle = 0;
 
     (void)unused;
     {
@@ -1035,11 +1077,21 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         Sleep(OHCI_TICK_MS);
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
+        plugged = s_plugged_pads > 0;
+
+        /* A connect change latched while the controller was Operational is
+         * still owed to the driver if it changes HCFS before this host thread
+         * gets scheduled.  QPR2 does exactly that in less than one 4 ms tick.
+         * Deliver only this already-latched root-hub event here; descriptor
+         * processing below remains restricted to the Operational state. */
+        if ((enable & INTR_MIE)
+                && (hc->reg[HcInterruptStatus / 4] & enable & INTR_RHSC))
+            goto deliver;
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            if (++waited > (30000u / OHCI_TICK_MS)) /* 30 s, never started */
                 break;
             continue;
         }
@@ -1052,21 +1104,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * status, so a device that was always there is one that never
          * arrives. */
         if (!plugged && (enable & INTR_RHSC)) {
-            /* Which port the device appears on decides which controller slot
-             * XAPI assigns it, and a title that reads "player 1" looks at slot
-             * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
-             * mapping can be found by measurement rather than assumed. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
-            if (port >= s_ndp) port = s_ndp - 1u;
-            hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
-            plugged = 1;
-            s_plugged_pads = 1;
-            first_port = port;
-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
-            fflush(stderr);
+            ohci_attach_first_pad(hc, waited * OHCI_TICK_MS);
+            plugged = s_plugged_pads > 0;
         }
 
         /* More pads, one at a time: each arrives after the previous one is
@@ -1076,7 +1115,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (plugged && s_plugged_pads < s_npads
             && usb_gamepad_configured(s_plugged_pads - 1)) {
             if (++settle > 50) {                 /* ~1 s after the last */
-                unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                unsigned port = (s_first_pad_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
                 hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
@@ -1259,6 +1298,8 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_plugged_pads = 0;
+    s_first_pad_port = 0;
     {
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");
@@ -1310,8 +1351,9 @@ void xbox_OhciInit(void)
 #endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
-                    "%d ports each, one device on HC0 port 1\n",
-            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
+                    "%u ports on device HC%d; %d virtual pad%s requested\n",
+            XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, s_ndp, s_device_hc, s_npads,
+            s_npads == 1 ? "" : "s");
     fflush(stderr);
 
 #if defined(_WIN32)

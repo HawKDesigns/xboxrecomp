@@ -27,6 +27,8 @@ set(KERNEL_SOURCES
     nv2a_pb_exec.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
+    nv2a_gpu_raster.c
+    nv2a_gpu_tiles.c
 )
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
@@ -43,7 +45,8 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt d3d11 dxgi dxguid d3dcompiler)
+    target_compile_definitions(xbox_kernel PRIVATE NV2A_ENABLE_GPU_RASTER=1)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
@@ -51,9 +54,12 @@ else()
 endif()
 
 if(MSVC)
+    # Shader specializations retain the interpreter's operation ordering.
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES COMPILE_OPTIONS "/fp:precise")
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 

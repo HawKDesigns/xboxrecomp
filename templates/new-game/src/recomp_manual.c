@@ -20,6 +20,30 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+/* WBINVD cannot run in a user-mode host process. Translated guest memory is
+ * coherent, so a full host fence preserves its relevant ordering effect. */
+void recomp_memory_fence(uint32_t va)
+{
+    (void)va;
+#if defined(_MSC_VER)
+    {
+        static volatile long fence_word;
+        (void)_InterlockedExchangeAdd(&fence_word, 0);
+    }
+#elif defined(__GNUC__) || defined(__clang__)
+    __sync_synchronize();
+#else
+    /* Best-effort compiler barrier for an otherwise unsupported host. */
+    {
+        volatile uint32_t fence_word = 0;
+        (void)fence_word;
+    }
+#endif
+}
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -196,4 +220,58 @@ void recomp_unimpl(const char *text, uint32_t va)
         fflush(stderr);
     }
     if (stop) abort();
+}
+
+/* Direct port I/O is title/hardware specific.  The reusable template keeps
+ * it observable and subject to RECOMP_UNIMPL_TRAP instead of silently
+ * discarding it.  A game project should replace only the ports it has
+ * identified and intentionally emulated or stubbed. */
+static void recomp_io_out_unsupported(uint16_t port, uint32_t value,
+                                      unsigned width, uint32_t va)
+{
+    fprintf(stderr,
+            "[IO] unsupported out%u port=0x%04X value=0x%08X at 0x%08X\n",
+            width, port, value, va);
+    fflush(stderr);
+    recomp_unimpl("out to unsupported I/O port", va);
+}
+
+void recomp_io_out8(uint16_t port, uint8_t value, uint32_t va)
+{
+    recomp_io_out_unsupported(port, value, 8, va);
+}
+
+void recomp_io_out16(uint16_t port, uint16_t value, uint32_t va)
+{
+    recomp_io_out_unsupported(port, value, 16, va);
+}
+
+void recomp_io_out32(uint16_t port, uint32_t value, uint32_t va)
+{
+    recomp_io_out_unsupported(port, value, 32, va);
+}
+
+static uint32_t recomp_io_in_unsupported(uint16_t port, unsigned width,
+                                         uint32_t va)
+{
+    fprintf(stderr, "[IO] unsupported in%u port=0x%04X at 0x%08X\n",
+            width, port, va);
+    fflush(stderr);
+    recomp_unimpl("in from unsupported I/O port", va);
+    return 0;
+}
+
+uint8_t recomp_io_in8(uint16_t port, uint32_t va)
+{
+    return (uint8_t)recomp_io_in_unsupported(port, 8, va);
+}
+
+uint16_t recomp_io_in16(uint16_t port, uint32_t va)
+{
+    return (uint16_t)recomp_io_in_unsupported(port, 16, va);
+}
+
+uint32_t recomp_io_in32(uint16_t port, uint32_t va)
+{
+    return recomp_io_in_unsupported(port, 32, va);
 }

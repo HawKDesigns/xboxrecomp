@@ -37,3 +37,6 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+# Generated or captured from a user's own game files. Keep these local.
+/src/kernel/nv2a_vsh_compiled.h
+/src/kernel/nv2a_gpu_literal_programs.h

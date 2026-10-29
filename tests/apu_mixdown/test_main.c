@@ -41,11 +41,14 @@ int main(void)
     mcpx_apu_dsp_frame(d, mixbins);
 
     for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i) {
-        if (d->monitor.frame_buf[i][0]) nonzero_left = 1;
-        if (d->monitor.frame_buf[i][1]) nonzero_right = 1;
+        if (d->monitor.mix_buf[i][0]) nonzero_left = 1;
+        if (d->monitor.mix_buf[i][1]) nonzero_right = 1;
     }
 
     if (expect_heard) {
+        /* Wide mixdown retains overload for the one final output limiter. */
+        if (d->monitor.mix_buf[0][0] != 1.5f * 32767.0f ||
+            d->monitor.mix_buf[0][1] != 1.0f * 32767.0f) abort();
         if (!nonzero_left || !nonzero_right) {
             fprintf(stderr,
                     "FAIL: signal in bins %d..%d did not reach the frame "

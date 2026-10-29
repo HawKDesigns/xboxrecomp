@@ -39,6 +39,10 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+/* Program writes are visible a dword at a time. Invalidate before the next
+ * execution whenever even an unused/partial instruction word changes. Live
+ * constant writes deliberately do not invalidate executable code. */
+static int s_native_dirty = 1;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -55,16 +59,22 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
-    if (s_load_slot < NV2A_VSH_SLOTS)
+    if (s_load_slot < NV2A_VSH_SLOTS) {
+        if (s_program[s_load_slot][s_load_word] != word) s_native_dirty = 1;
         s_program[s_load_slot][s_load_word] = word;
+    }
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) {
+    if (s_start_slot != slot) s_native_dirty = 1;
+    s_start_slot = slot;
+}
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+int nv2a_vsh_cacheable(void) { return s_cxt_write==0; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
 {
@@ -90,8 +100,10 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
-    if (slot < NV2A_VSH_SLOTS)
+    if (slot < NV2A_VSH_SLOTS) {
+        if (memcmp(s_program[slot], words, sizeof s_program[slot])) s_native_dirty = 1;
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    }
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -157,6 +169,21 @@ static void dump_program(uint32_t start)
             break;
     }
     fflush(stderr);
+}
+
+void nv2a_vsh_trace_state(void)
+{
+    uint32_t i;
+    fprintf(stderr, "[VSTATE] start=%u context_write=%u\n", s_start_slot, s_cxt_write);
+    dump_program(s_start_slot);
+    for (i = s_start_slot; i < NV2A_VSH_SLOTS; ++i) {
+        fprintf(stderr, "[VSTATE] instruction[%u]=%08X %08X %08X %08X\n", i,
+            s_program[i][0], s_program[i][1], s_program[i][2], s_program[i][3]);
+        if (field(s_program[i], 3, 0, 1)) break;
+    }
+    for (i = 0; i < NV2A_VSH_CONSTANTS; ++i)
+        fprintf(stderr, "[VSTATE] c[%u]=%.9g %.9g %.9g %.9g\n", i,
+            s_const[i][0], s_const[i][1], s_const[i][2], s_const[i][3]);
 }
 
 const float *nv2a_vsh_constant(uint32_t index)
@@ -305,7 +332,7 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
-int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+static int nv2a_vsh_run_interpreted(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
     static uint32_t dumped[16];
@@ -398,4 +425,89 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         }
     }
     return 0;
+}
+
+/* Generated scalar SSA removes opcode decoding, temporary-register arrays,
+ * unused components and per-instruction dispatch. This is CPU execution;
+ * the existing exact clipper and pixel renderer retain their current inputs. */
+#if defined(__has_include) && __has_include("nv2a_vsh_compiled.h")
+#include "nv2a_vsh_compiled.h"
+#define NV_VSH_COMPILED_COUNT (sizeof nv_vsh_compiled / sizeof nv_vsh_compiled[0])
+#else
+#include "nv2a_vsh_compiled_fallback.h"
+#define NV_VSH_COMPILED_COUNT 0u
+#endif
+
+static const NvVshCompiled *s_native;
+static int s_native_enabled = -1;
+static uint64_t s_native_runs, s_interpreted_runs, s_native_matches, s_native_misses;
+
+static const NvVshCompiled *nv2a_vsh_resolve_native(void)
+{
+    if (s_native_enabled < 0) {
+        const char *e = getenv("RECOMP_VERTEX_NATIVE");
+        s_native_enabled = (!e || atoi(e) > 0) && !getenv("RECOMP_VSH_DUMP");
+    }
+    if (!s_native_enabled || s_cxt_write) return NULL;
+    if (s_native_dirty) {
+        unsigned end = s_start_slot;
+        s_native_dirty = 0;
+        s_native = NULL;
+        for (; end < NV2A_VSH_SLOTS; ++end) {
+            if (s_program[end][3] & 1u) {
+                unsigned n = end - s_start_slot + 1;
+                for (unsigned i = 0; i < NV_VSH_COMPILED_COUNT; ++i) {
+                    const NvVshCompiled *p = &nv_vsh_compiled[i];
+                    if (p->count == n && !memcmp(p->words, &s_program[s_start_slot], n * sizeof s_program[0])) {
+                        s_native = p;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        if (s_native) ++s_native_matches; else ++s_native_misses;
+    }
+    return s_native;
+}
+
+uint32_t nv2a_vsh_input_mask(void)
+{
+    const NvVshCompiled *p = nv2a_vsh_resolve_native();
+    return p ? p->inputs : 0xffffu;
+}
+int nv2a_vsh_snapshot(Nv2aVshSnapshot *s)
+{
+    const NvVshCompiled *p=nv2a_vsh_resolve_native();
+    if(!p || !p->position_kind)return 0;
+    s->program_id=(unsigned)(p-nv_vsh_compiled);s->count=p->count;
+    s->inputs=p->inputs;s->position_kind=p->position_kind;s->words=p->words;s->constants=s_const;
+    return 1;
+}
+unsigned nv2a_vsh_known_count(void){return (unsigned)NV_VSH_COMPILED_COUNT;}
+const uint32_t (*nv2a_vsh_known_program(unsigned id,unsigned *count))[4]
+{
+    if(id>=nv2a_vsh_known_count()){*count=0;return NULL;}
+    *count=nv_vsh_compiled[id].count;return nv_vsh_compiled[id].words;
+}
+
+int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    const NvVshCompiled *p = nv2a_vsh_resolve_native();
+    if (p) {
+        ++s_native_runs;
+        p->run(in, out);
+        return 1;
+    }
+    ++s_interpreted_runs;
+    return nv2a_vsh_run_interpreted(in, out);
+}
+
+void nv2a_vsh_report(void)
+{
+    fprintf(stderr, "[VERTEX-NATIVE] enabled=%u variants=%u native_vertices=%llu interpreted_vertices=%llu program_matches=%llu program_misses=%llu\n",
+        (unsigned)(s_native_enabled > 0), (unsigned)NV_VSH_COMPILED_COUNT,
+        (unsigned long long)s_native_runs, (unsigned long long)s_interpreted_runs,
+        (unsigned long long)s_native_matches, (unsigned long long)s_native_misses);
+    s_native_runs = s_interpreted_runs = s_native_matches = s_native_misses = 0;
 }
