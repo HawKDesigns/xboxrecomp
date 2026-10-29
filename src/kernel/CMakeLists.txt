@@ -31,7 +31,31 @@ set(KERNEL_SOURCES
     nv2a_gpu_tiles.c
 )
 
+# Build the generic embedded shader locally from source. Optional QPR2 literal
+# bodies are generated from a user-owned GPU capture, never committed.
+if(WIN32)
+    set(QPR2_SHADER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(QPR2_SHADER_INPUTS)
+    foreach(name nv2a_gpu_raster.hlsl nv2a_gpu_rov.hlsl nv2a_gpu_report_reset.hlsl
+                 nv2a_gpu_coverage.hlsl nv2a_gpu_clear.hlsl nv2a_gpu_types.h
+                 nv2a_gpu_pixel.inc nv2a_gpu_literal.inc nv2a_gpu_compact.inc
+                 nv2a_gpu_shade.inc nv2a_gpu_source.inc nv2a_gpu_geometry.hlsl
+                 nv2a_gpu_texcopy.hlsl nv2a_gpu_raw_types.h nv2a_gpu_vsh.inc
+                 nv2a_gpu_prepare.inc)
+        list(APPEND QPR2_SHADER_INPUTS "${QPR2_SHADER_ROOT}/${name}")
+    endforeach()
+    add_custom_command(OUTPUT "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h"
+        COMMAND "${CMAKE_COMMAND}" "-DINPUT_ROOT=${QPR2_SHADER_ROOT}"
+                -P "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
+        DEPENDS ${QPR2_SHADER_INPUTS} "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
+        VERBATIM)
+    add_custom_target(xbox_kernel_shader_sources DEPENDS "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h")
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+if(WIN32)
+    add_dependencies(xbox_kernel xbox_kernel_shader_sources)
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
