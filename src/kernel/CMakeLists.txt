@@ -44,12 +44,31 @@ if(WIN32)
                  nv2a_gpu_prepare.inc)
         list(APPEND QPR2_SHADER_INPUTS "${QPR2_SHADER_ROOT}/${name}")
     endforeach()
-    add_custom_command(OUTPUT "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h"
+    # ZIP extraction and generated local shaders can preserve older timestamps
+    # than an already embedded header. Always compare source content before
+    # compiling; the embedding script writes only when bytes actually change.
+    add_custom_target(xbox_kernel_shader_sources
         COMMAND "${CMAKE_COMMAND}" "-DINPUT_ROOT=${QPR2_SHADER_ROOT}"
                 -P "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
+        BYPRODUCTS "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h"
         DEPENDS ${QPR2_SHADER_INPUTS} "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
         VERBATIM)
-    add_custom_target(xbox_kernel_shader_sources DEPENDS "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h")
+
+    # A header first created after a generic build was not an include in the
+    # old object file. Toggle per-source compile definitions on reconfigure so
+    # MSBuild must rebuild the raster and vertex objects when it appears.
+    set(QPR2_LITERAL_HEADER_PRESENT 0)
+    if(EXISTS "${QPR2_SHADER_ROOT}/nv2a_gpu_literal_programs.h")
+        set(QPR2_LITERAL_HEADER_PRESENT 1)
+    endif()
+    set_source_files_properties(nv2a_gpu_raster.c PROPERTIES
+        COMPILE_DEFINITIONS "NV2A_QPR2_LITERAL_HEADER_PRESENT=${QPR2_LITERAL_HEADER_PRESENT}")
+    set(QPR2_NATIVE_VSH_HEADER_PRESENT 0)
+    if(EXISTS "${QPR2_SHADER_ROOT}/nv2a_vsh_compiled.h")
+        set(QPR2_NATIVE_VSH_HEADER_PRESENT 1)
+    endif()
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES
+        COMPILE_DEFINITIONS "NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT=${QPR2_NATIVE_VSH_HEADER_PRESENT}")
 endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})

@@ -28,7 +28,15 @@ typedef struct {
 #include "nv2a_gpu_geometry_state.h"
 #include "nv2a_gpu_depth_seed.h"
 #include "nv2a_gpu_material_usage.h"
-#if defined(__has_include) && __has_include("nv2a_gpu_literal_programs.h")
+#if defined(NV2A_QPR2_LITERAL_HEADER_PRESENT)
+# if NV2A_QPR2_LITERAL_HEADER_PRESENT
+#  include "nv2a_gpu_literal_programs.h"
+#  define NV_GPU_LITERAL_AVAILABLE 1u
+# else
+#  include "nv2a_gpu_literal_fallback.h"
+#  define NV_GPU_LITERAL_AVAILABLE 0u
+# endif
+#elif defined(__has_include) && __has_include("nv2a_gpu_literal_programs.h")
 #include "nv2a_gpu_literal_programs.h"
 #define NV_GPU_LITERAL_AVAILABLE 1u
 #else

@@ -430,7 +430,15 @@ static int nv2a_vsh_run_interpreted(const float in[NV2A_VSH_INPUTS][4], Nv2aVshO
 /* Generated scalar SSA removes opcode decoding, temporary-register arrays,
  * unused components and per-instruction dispatch. This is CPU execution;
  * the existing exact clipper and pixel renderer retain their current inputs. */
-#if defined(__has_include) && __has_include("nv2a_vsh_compiled.h")
+#if defined(NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT)
+# if NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT
+#  include "nv2a_vsh_compiled.h"
+#  define NV_VSH_COMPILED_COUNT (sizeof nv_vsh_compiled / sizeof nv_vsh_compiled[0])
+# else
+#  include "nv2a_vsh_compiled_fallback.h"
+#  define NV_VSH_COMPILED_COUNT 0u
+# endif
+#elif defined(__has_include) && __has_include("nv2a_vsh_compiled.h")
 #include "nv2a_vsh_compiled.h"
 #define NV_VSH_COMPILED_COUNT (sizeof nv_vsh_compiled / sizeof nv_vsh_compiled[0])
 #else
