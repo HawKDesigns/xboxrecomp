@@ -288,9 +288,19 @@ static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
     if(screen[0].hi<(double)in->params.left-1 || screen[0].lo>(double)in->params.right+1 ||
        screen[1].hi<(double)in->params.top-1 || screen[1].lo>(double)in->params.bottom+1)return -1;
     if(in->zclip && (screen[2].hi<(double)in->zmin-1 || screen[2].lo>(double)in->zmax+1))return -1;
-    if(screen[0].lo<(double)in->params.left+1 || screen[0].hi>(double)in->params.right-1 ||
-       screen[1].lo<(double)in->params.top+1 || screen[1].hi>(double)in->params.bottom-1)return 0;
+    /* The hardware pixel pass already clips its bounding span to the
+     * viewport. With positive W and safely interior depth, leaving an X/Y
+     * crossing triangle intact preserves the visible pixel centers and
+     * perspective interpolation. Retain the CPU clipper for near/far and
+     * poorly bounded coordinates. */
     if(in->zclip && (screen[2].lo<(double)in->zmin+1e-3 || screen[2].hi>(double)in->zmax-1e-3))return 0;
+    int xy_cross=screen[0].lo<(double)in->params.left+1 || screen[0].hi>(double)in->params.right-1 ||
+                 screen[1].lo<(double)in->params.top+1 || screen[1].hi>(double)in->params.bottom-1;
+    if(xy_cross){
+        if(!raw.xy_crossing_enabled || screen[0].lo<-4096 || screen[0].hi>4096 ||
+           screen[1].lo<-4096 || screen[1].hi>4096)return 0;
+        if(!g.selftest)++raw.xy_promoted;
+    }
     return 1;
 }
 /* An object AABB loses correlation between coordinate extrema. Per-vertex
@@ -584,6 +594,7 @@ static int gpu_raw_initialize(void)
     const char *e=getenv("RECOMP_GPU_GEOMETRY");if(!e || atoi(e)<=0 || !g.native || !g.coverage || !g.native_batch)return 0;
     const char *stream=getenv("RECOMP_GPU_RAW_UPLOAD_STREAM");raw.input_stream=!stream || atoi(stream)>0;
     const char *coalesce=getenv("RECOMP_GPU_MIXED_UPLOAD_COALESCE");raw.upload_coalesce=!coalesce || atoi(coalesce)>0;
+    const char *xy=getenv("RECOMP_GPU_XY_CROSSING");raw.xy_crossing_enabled=!xy || atoi(xy)>0;
     gpu_raw_cache_configure();
     raw.program_count=nv2a_vsh_known_count();if(!raw.program_count || raw.program_count>256)return 0;
     unsigned words=0;
@@ -647,6 +658,9 @@ static void gpu_raw_report(void)
         (unsigned)raw.ready,(unsigned long long)raw.draws_queued,(unsigned long long)raw.vertices_queued,(unsigned long long)raw.triangles_queued,(unsigned long long)raw.dispatches,
         (unsigned long long)raw.hits,(unsigned long long)raw.misses,(unsigned long long)raw.uploads,(unsigned long long)raw.uploaded_bytes,
         (unsigned long long)raw.bounds_rejected,(unsigned long long)raw.boundary_fallbacks,(unsigned long long)raw.host_bytes,(unsigned long long)raw.batches,(unsigned long long)raw.batch_peak,(unsigned long long)raw.evictions,(unsigned long long)raw.resident_bytes,raw.cache_limit,raw.entries,raw.resident_entries);
+    fprintf(stderr,"[GPU-XY-CROSSING] enabled=%u promoted=%llu depth_guard=1 max_abs_screen=4096\n",
+        (unsigned)raw.xy_crossing_enabled,(unsigned long long)raw.xy_promoted);
+    raw.xy_promoted=0;
     fprintf(stderr,"[GPU-POINT-BOUNDS] enabled=%u attempted=%llu inside=%llu outside=%llu large=%llu uncertain=%llu max_vertices=256\n",
         (unsigned)raw.point_bounds_enabled,(unsigned long long)raw.point_attempted,(unsigned long long)raw.point_inside,
         (unsigned long long)raw.point_outside,(unsigned long long)raw.point_large,(unsigned long long)raw.point_unsafe);
@@ -797,7 +811,8 @@ pixel_done:
         if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=1)ok=0;
         positions[2][0]=33;
         candidate=gpu_raw_mesh(&proof);
-        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=0)ok=0;
+        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=(raw.xy_crossing_enabled?1:0) ||
+           gpu_raw_bounds(candidate,&proof)!=(raw.xy_crossing_enabled?1:0))ok=0;
         positions[2][0]=4;proof_constants[96][3]=-20;
         candidate=gpu_raw_mesh(&proof);
         if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=-1)ok=0;

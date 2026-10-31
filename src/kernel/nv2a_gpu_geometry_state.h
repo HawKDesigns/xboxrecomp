@@ -45,7 +45,8 @@ static struct {
     unsigned stream_union,stream_union_rejected;
     unsigned word_hash;
     unsigned profile_enabled;NvRawProfile profile[6];
-    int point_bounds_enabled;
+    int point_bounds_enabled,xy_crossing_enabled;
+    uint64_t xy_promoted;
     uint64_t point_attempted,point_inside,point_outside,point_large,point_unsafe;
     struct {uint64_t lookups,overlapped,logical,unique,copy_legacy,copied,upload_legacy,uploaded;} stream_bytes;
     size_t resident_bytes;
