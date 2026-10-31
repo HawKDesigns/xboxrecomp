@@ -77,6 +77,9 @@ typedef struct {
     uint8_t *host_color;
     float *host_depth;
     unsigned depth_stride,left,right,top,bottom,triangles;
+    uintptr_t color_canonical,depth_canonical;
+    size_t color_span,depth_span;
+    int range_valid;
 } GpuPendingReadback;
 static struct {
     int init, active, selftest, resident,readback_failed;
@@ -155,6 +158,7 @@ static struct {
     GpuPendingReadback pending[NV_GPU_PENDING_READBACKS];
     unsigned pending_count;
     uint64_t queued_readbacks,pending_peak,pending_dependencies,pending_capacity;
+    uint64_t pending_fast_empty,pending_range_checks;
     double pending_submit_ms;
     struct {uint64_t binds,queued,readbacks,pixels,empty_skips;double map_wait_ms;} target_shape[4];
     struct {
@@ -221,7 +225,7 @@ static struct {
     double clear_ms;
     double submit_ms, readback_ms, texture_ms, target_ms, map_ms, copy_ms;
     struct {uint64_t batches;double upload_ms,raw_ms,raster_ms,total_ms;} flush_time;
-    int readback_simd,partial_readback;
+    int readback_simd,partial_readback,fast_pending_access;
     struct { int enabled; uint64_t batches, older_targets, current_bytes; } readback_batch;
     struct {
         double enqueue_ms,map_wait_ms,unpack_ms,publish_ms,counters_ms,unmap_ms,capture_ms;
@@ -611,12 +615,41 @@ static size_t gpu_target_depth_bytes(const NvGpuState *s,unsigned stride)
 {
     return ((size_t)(s->height-1)*stride+s->width)*sizeof(float);
 }
+static int gpu_canonical_overlap(uintptr_t address,size_t bytes,
+                                 uintptr_t other,size_t other_bytes)
+{
+    if(!other_bytes || !bytes)return 0;
+    if(bytes>UINTPTR_MAX-address || other_bytes>UINTPTR_MAX-other)return 1;
+    return address<other+other_bytes && other<address+bytes;
+}
 static int gpu_pending_access(const void *address,size_t bytes)
 {
+    if(!g.fast_pending_access){
+        for(unsigned i=0;i<g.pending_count;i++) {
+            GpuPendingReadback *p=&g.pending[i];
+            if(gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
+               gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride))) {
+                if(!g.selftest)++g.pending_dependencies;
+                return gpu_pending_drain();
+            }
+        }
+        return 1;
+    }
+    if(!g.pending_count){
+        if(!g.selftest)++g.pending_fast_empty;
+        return 1;
+    }
+    if(!address || !bytes)return 1;
+    if(!g.selftest)++g.pending_range_checks;
+    uintptr_t canonical=gpu_canonical_host(address);
     for(unsigned i=0;i<g.pending_count;i++) {
         GpuPendingReadback *p=&g.pending[i];
-        if(gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
-           gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride))) {
+        int overlap=p->range_valid?
+            (gpu_canonical_overlap(canonical,bytes,p->color_canonical,p->color_span) ||
+             gpu_canonical_overlap(canonical,bytes,p->depth_canonical,p->depth_span)):
+            (gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
+             gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride)));
+        if(overlap) {
             if(!g.selftest)++g.pending_dependencies;
             return gpu_pending_drain();
         }
@@ -627,6 +660,8 @@ int nv_gpu_guest_access(uint64_t address,uint64_t bytes)
 {
     /* Only the FIFO/executor owner calls this, after startup publication. */
     if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !bytes)return 1;
+    if(g.fast_pending_access && !g.pending_count &&
+       !(g.active && (g.resume.active || g.completion.unpublished)))return 1;
     uintptr_t base=(uintptr_t)xbox_GetMemoryOffset();
     if(address>UINT32_MAX || bytes>0x100000000ull-address || address>UINTPTR_MAX-base || bytes>SIZE_MAX)
         return ((g.resume.active || g.completion.unpublished) && g.active?
@@ -718,6 +753,13 @@ static int gpu_queue_readback(void)
     if(timing){gpu_timing_phase_end(NV_GPU_TIME_COPY);gpu_timing_batch_end(timing);}
     p->target=g.target;p->host_color=g.host_color;p->host_depth=g.host_depth;p->depth_stride=g.depth_stride;
     p->left=g.dirty_left;p->right=g.dirty_right;p->top=g.dirty_top;p->bottom=g.dirty_bottom;
+    /* FIFO reads touch each word; save the canonical target ranges once when
+     * this immutable version is queued, not once for every subsequent word. */
+    p->color_canonical=gpu_canonical_host(p->host_color);
+    p->color_span=p->host_color?gpu_target_color_bytes(&p->target):0;
+    p->depth_canonical=gpu_canonical_host(p->host_depth);
+    p->depth_span=p->host_depth?gpu_target_depth_bytes(&p->target,p->depth_stride):0;
+    p->range_valid=1;
     p->triangles=g.pending_triangles;++g.pending_count;
     if(!g.selftest){++g.queued_readbacks;g.pending_submit_ms+=gpu_ms()-begin;
         ++g.target_shape[gpu_target_shape(g.target.width,g.target.height)].queued;
@@ -2029,6 +2071,8 @@ static int gpu_initialize(void)
     if(!enabled || atoi(enabled)<=0)return 0;
     const char *defer=getenv("RECOMP_GPU_DEFER_READBACK");
     g.deferred_readback.enabled=!defer || atoi(defer)>0;
+    const char *fast_pending=getenv("RECOMP_GPU_FAST_PENDING_ACCESS");
+    g.fast_pending_access=!fast_pending || atoi(fast_pending)>0;
     const char *partial_readback=getenv("RECOMP_GPU_PARTIAL_READBACK");
     g.partial_readback=!partial_readback || atoi(partial_readback)>0;
     const char *simd=getenv("RECOMP_GPU_READBACK_SIMD");
@@ -3097,6 +3141,10 @@ void nv_gpu_report(void)
     fprintf(stderr,"[GPU-READBACK-QUEUE] enabled=%u copies=%llu peak=%llu dependency_drains=%llu capacity_drains=%llu submit_ms=%.3f pending=%u\n",
         (unsigned)g.readback_queue,(unsigned long long)g.queued_readbacks,(unsigned long long)g.pending_peak,
         (unsigned long long)g.pending_dependencies,(unsigned long long)g.pending_capacity,g.pending_submit_ms,g.pending_count);
+    fprintf(stderr,"[GPU-PENDING-ACCESS] enabled=%u empty=%llu range_checks=%llu\n",
+        (unsigned)g.fast_pending_access,(unsigned long long)g.pending_fast_empty,
+        (unsigned long long)g.pending_range_checks);
+    g.pending_fast_empty=g.pending_range_checks=0;
     g.queued_readbacks=g.pending_peak=g.pending_dependencies=g.pending_capacity=0;g.pending_submit_ms=0;
     fprintf(stderr,"[GPU-EMPTY-STATS] enabled=%u skipped_readbacks=%llu initialized_targets=%llu\n",
         (unsigned)g.skip_empty_stats,(unsigned long long)g.empty_stats_skips,(unsigned long long)g.stats_initializations);
