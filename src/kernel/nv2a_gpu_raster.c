@@ -858,6 +858,7 @@ static int gpu_pending_drain(void)
             ++g.sync_reason[slot].count;g.sync_reason[slot].ms+=ms;
         }
     }
+    for(unsigned i=0;i<g.pending_count;i++)g.pending[i].range_valid=0;
     g.pending_count=0;return 1;
 }
 static int gpu_readback(const char *reason)
