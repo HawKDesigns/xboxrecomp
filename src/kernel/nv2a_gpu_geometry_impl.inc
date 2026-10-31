@@ -298,7 +298,11 @@ static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
                  screen[1].lo<(double)in->params.top+1 || screen[1].hi>(double)in->params.bottom-1;
     if(xy_cross){
         if(!raw.xy_crossing_enabled || screen[0].lo<-4096 || screen[0].hi>4096 ||
-           screen[1].lo<-4096 || screen[1].hi>4096)return 0;
+           screen[1].lo<-4096 || screen[1].hi>4096 ||
+           screen[0].lo+screen[0].hi<2.0*in->params.left ||
+           screen[0].lo+screen[0].hi>2.0*in->params.right ||
+           screen[1].lo+screen[1].hi<2.0*in->params.top ||
+           screen[1].lo+screen[1].hi>2.0*in->params.bottom)return 0;
         if(!g.selftest)++raw.xy_promoted;
     }
     return 1;
@@ -612,6 +616,18 @@ static int gpu_raw_initialize(void)
     raw.ready=raw.testing=1;
     {int checked=gpu_raw_selftest();
         if(checked<0 || g.readback_failed){raw.testing=raw.ready=0;return -1;}
+        if(!checked && raw.xy_crossing_enabled){
+            /* An edge proof must not take the entire GPU geometry path down.
+             * Restore the verified legacy bounds before any guest draws. */
+            raw.xy_crossing_enabled=0;
+            gpu_raw_reset();for(unsigned i=0;i<NV_RAW_MESHES;i++)gpu_raw_mesh_release(raw.mesh+i);
+            g.active=g.resident=0;g.queued_count=g.state_count=g.queued_refs=0;g.pending_count=0;
+            for(unsigned i=0;i<128;i++)g.cache[i].queued=0;
+            g.host_color=NULL;g.host_depth=NULL;memset(&g.completed,0,sizeof g.completed);
+            fprintf(stderr,"[GPU-XY-CROSSING] startup proof failed; GPU geometry retries with CPU edge clipper\\n");
+            checked=gpu_raw_selftest();
+            if(checked<0 || g.readback_failed){raw.testing=raw.ready=0;return -1;}
+        }
         if(!checked && raw.stream_union){
             /* Only private startup consumers exist here. Revert the storage
              * representation as one policy before exposing geometry to guests. */
@@ -808,7 +824,8 @@ pixel_done:
         proof.params.right=proof.params.bottom=32;
         proof.stream[0]=(NvRawStream){(const uint8_t*)positions,sizeof positions,sizeof positions[0],2,4};
         NvRawMesh *candidate=gpu_raw_mesh(&proof);
-        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=1)ok=0;
+        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=(raw.xy_crossing_enabled?1:0) ||
+           gpu_raw_bounds(candidate,&proof)!=1)ok=0;
         positions[2][0]=33;
         candidate=gpu_raw_mesh(&proof);
         if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=(raw.xy_crossing_enabled?1:0) ||
