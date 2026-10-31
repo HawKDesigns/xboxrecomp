@@ -221,7 +221,7 @@ static struct {
     double clear_ms;
     double submit_ms, readback_ms, texture_ms, target_ms, map_ms, copy_ms;
     struct {uint64_t batches;double upload_ms,raw_ms,raster_ms,total_ms;} flush_time;
-    int readback_simd;
+    int readback_simd,partial_readback;
     struct { int enabled; uint64_t batches, older_targets, current_bytes; } readback_batch;
     struct {
         double enqueue_ms,map_wait_ms,unpack_ms,publish_ms,counters_ms,unmap_ms,capture_ms;
@@ -434,23 +434,27 @@ static void gpu_copy_dirty_surface(ID3D11Resource *destination,ID3D11Resource *s
 {
     unsigned full=width*height*(unsigned)sizeof(GpuSurface);
     if(top>=bottom || top>=height){
-        if(!g.selftest){++g.readback_time.surface_empty;g.readback_time.surface_bytes_avoided+=full;}
+        if(!g.partial_readback)ID3D11DeviceContext_CopyResource(g.context,destination,source);
+        if(!g.selftest){++g.readback_time.surface_empty;
+            g.readback_time.surface_bytes+=g.partial_readback?0:full;
+            g.readback_time.surface_bytes_avoided+=g.partial_readback?full:0;}
         return;
     }
     if(bottom>height)bottom=height;
     unsigned first=top*width*(unsigned)sizeof(GpuSurface);
     unsigned last=bottom*width*(unsigned)sizeof(GpuSurface);
-    if(first==0 && last==full)
+    if(!g.partial_readback || (first==0 && last==full))
         ID3D11DeviceContext_CopyResource(g.context,destination,source);
     else {
         D3D11_BOX rows={first,0,0,last,1,1};
         ID3D11DeviceContext_CopySubresourceRegion(g.context,destination,0,first,0,0,source,0,&rows);
     }
     if(!g.selftest){
+        unsigned copied=g.partial_readback?last-first:full;
         ++g.readback_time.surface_copies;
-        g.readback_time.surface_partial+=(last-first)<full;
-        g.readback_time.surface_bytes+=last-first;
-        g.readback_time.surface_bytes_avoided+=full-(last-first);
+        g.readback_time.surface_partial+=copied<full;
+        g.readback_time.surface_bytes+=copied;
+        g.readback_time.surface_bytes_avoided+=full-copied;
     }
 }
 /* Enqueue only: callers must flush rendering first and keep this target's
@@ -2025,6 +2029,8 @@ static int gpu_initialize(void)
     if(!enabled || atoi(enabled)<=0)return 0;
     const char *defer=getenv("RECOMP_GPU_DEFER_READBACK");
     g.deferred_readback.enabled=!defer || atoi(defer)>0;
+    const char *partial_readback=getenv("RECOMP_GPU_PARTIAL_READBACK");
+    g.partial_readback=!partial_readback || atoi(partial_readback)>0;
     const char *simd=getenv("RECOMP_GPU_READBACK_SIMD");
     g.readback_simd=NV_GPU_SURFACE_SSE2 && (!simd || atoi(simd)>0);
     const char *batch_readback=getenv("RECOMP_GPU_BATCH_READBACK");
@@ -3082,8 +3088,9 @@ void nv_gpu_report(void)
         g.readback_time.enqueue_ms,g.readback_time.map_wait_ms,g.readback_time.unpack_ms,g.readback_time.publish_ms,
         g.readback_time.counters_ms,g.readback_time.unmap_ms,g.readback_time.capture_ms,
         (unsigned long long)g.readback_time.pixels,(unsigned long long)g.readback_time.simd_rows,(unsigned long long)g.readback_time.scalar_rows);
-    fprintf(stderr,"[GPU-READBACK-ROWS] copies=%llu partial=%llu empty=%llu bytes=%llu bytes_avoided=%llu\n",
-        (unsigned long long)g.readback_time.surface_copies,(unsigned long long)g.readback_time.surface_partial,
+    fprintf(stderr,"[GPU-READBACK-ROWS] enabled=%u copies=%llu partial=%llu empty=%llu bytes=%llu bytes_avoided=%llu\n",
+        (unsigned)g.partial_readback,(unsigned long long)g.readback_time.surface_copies,
+        (unsigned long long)g.readback_time.surface_partial,
         (unsigned long long)g.readback_time.surface_empty,(unsigned long long)g.readback_time.surface_bytes,
         (unsigned long long)g.readback_time.surface_bytes_avoided);
     memset(&g.readback_time,0,sizeof g.readback_time);
