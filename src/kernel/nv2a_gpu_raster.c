@@ -226,6 +226,7 @@ static struct {
     struct {
         double enqueue_ms,map_wait_ms,unpack_ms,publish_ms,counters_ms,unmap_ms,capture_ms;
         uint64_t current,queued,pixels,simd_rows,scalar_rows;
+        uint64_t surface_copies,surface_partial,surface_empty,surface_bytes,surface_bytes_avoided;
     } readback_time;
     struct {char name[64];uint64_t count;double ms;} sync_reason[20];
 } g;
@@ -424,13 +425,42 @@ static unsigned gpu_target_shape(unsigned width,unsigned height)
     if(width==128 && height==128)return 2;
     return 3;
 }
+/* A staging buffer is indexed by complete surface rows. Readback consumers
+ * publish only the dirty rectangle; transfer its containing row span while
+ * leaving all other staging bytes unobserved. The paired GPU snapshot remains
+ * complete for feedback and target resume. */
+static void gpu_copy_dirty_surface(ID3D11Resource *destination,ID3D11Resource *source,
+                                   unsigned width,unsigned height,unsigned top,unsigned bottom)
+{
+    unsigned full=width*height*(unsigned)sizeof(GpuSurface);
+    if(top>=bottom || top>=height){
+        if(!g.selftest){++g.readback_time.surface_empty;g.readback_time.surface_bytes_avoided+=full;}
+        return;
+    }
+    if(bottom>height)bottom=height;
+    unsigned first=top*width*(unsigned)sizeof(GpuSurface);
+    unsigned last=bottom*width*(unsigned)sizeof(GpuSurface);
+    if(first==0 && last==full)
+        ID3D11DeviceContext_CopyResource(g.context,destination,source);
+    else {
+        D3D11_BOX rows={first,0,0,last,1,1};
+        ID3D11DeviceContext_CopySubresourceRegion(g.context,destination,0,first,0,0,source,0,&rows);
+    }
+    if(!g.selftest){
+        ++g.readback_time.surface_copies;
+        g.readback_time.surface_partial+=(last-first)<full;
+        g.readback_time.surface_bytes+=last-first;
+        g.readback_time.surface_bytes_avoided+=full-(last-first);
+    }
+}
 /* Enqueue only: callers must flush rendering first and keep this target's
  * resources/stats unchanged until gpu_readback_current_mode consumes them. */
 static double gpu_readback_enqueue_current(void)
 {
     double begin=gpu_ms();
     unsigned timing=gpu_timing_batch_begin(1);if(timing)gpu_timing_phase_begin(NV_GPU_TIME_COPY,(uint64_t)g.target.width*g.target.height);
-    if(g.native)ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.surface.readback,(ID3D11Resource*)g.surface.buffer);
+    if(g.native)gpu_copy_dirty_surface((ID3D11Resource*)g.surface.readback,(ID3D11Resource*)g.surface.buffer,
+        g.target.width,g.target.height,g.dirty_top,g.dirty_bottom);
     else {
         ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.color.readback,(ID3D11Resource*)g.color.buffer);
         ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.depth.readback,(ID3D11Resource*)g.depth.buffer);
@@ -678,7 +708,8 @@ static int gpu_queue_readback(void)
     if(defer_surface) {
         p->surface_copy_pending=1;
         if(!g.selftest)++g.deferred_readback.deferred;
-    } else ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)p->surface,(ID3D11Resource*)g.surface.buffer);
+    } else gpu_copy_dirty_surface((ID3D11Resource*)p->surface,(ID3D11Resource*)g.surface.buffer,
+        g.target.width,g.target.height,g.dirty_top,g.dirty_bottom);
     if(p->has_stats)ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)p->stats,(ID3D11Resource*)g.stats.buffer);
     if(timing){gpu_timing_phase_end(NV_GPU_TIME_COPY);gpu_timing_batch_end(timing);}
     p->target=g.target;p->host_color=g.host_color;p->host_depth=g.host_depth;p->depth_stride=g.depth_stride;
@@ -705,7 +736,8 @@ static int gpu_pending_drain(void)
         if(p->publish_surface) {
             unsigned timing=gpu_timing_batch_begin(1);
             if(timing)gpu_timing_phase_begin(NV_GPU_TIME_COPY,(uint64_t)p->target.width*p->target.height);
-            ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)p->surface,(ID3D11Resource*)p->snapshot.buffer);
+            gpu_copy_dirty_surface((ID3D11Resource*)p->surface,(ID3D11Resource*)p->snapshot.buffer,
+                p->target.width,p->target.height,p->top,p->bottom);
             if(timing){gpu_timing_phase_end(NV_GPU_TIME_COPY);gpu_timing_batch_end(timing);}
             if(!g.selftest)++g.deferred_readback.issued;
         } else if(!g.selftest) {
@@ -3050,6 +3082,10 @@ void nv_gpu_report(void)
         g.readback_time.enqueue_ms,g.readback_time.map_wait_ms,g.readback_time.unpack_ms,g.readback_time.publish_ms,
         g.readback_time.counters_ms,g.readback_time.unmap_ms,g.readback_time.capture_ms,
         (unsigned long long)g.readback_time.pixels,(unsigned long long)g.readback_time.simd_rows,(unsigned long long)g.readback_time.scalar_rows);
+    fprintf(stderr,"[GPU-READBACK-ROWS] copies=%llu partial=%llu empty=%llu bytes=%llu bytes_avoided=%llu\n",
+        (unsigned long long)g.readback_time.surface_copies,(unsigned long long)g.readback_time.surface_partial,
+        (unsigned long long)g.readback_time.surface_empty,(unsigned long long)g.readback_time.surface_bytes,
+        (unsigned long long)g.readback_time.surface_bytes_avoided);
     memset(&g.readback_time,0,sizeof g.readback_time);
     fprintf(stderr,"[GPU-READBACK-QUEUE] enabled=%u copies=%llu peak=%llu dependency_drains=%llu capacity_drains=%llu submit_ms=%.3f pending=%u\n",
         (unsigned)g.readback_queue,(unsigned long long)g.queued_readbacks,(unsigned long long)g.pending_peak,
