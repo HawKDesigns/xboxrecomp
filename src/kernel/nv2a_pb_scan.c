@@ -68,6 +68,7 @@ static double s_fifo_ms;
 static uint64_t s_fifo_parameters,s_fifo_words,s_fifo_polls;
 typedef struct {uint32_t rng;uint64_t calls,samples;double sample_ms,peak_ms;} FifoCpuProbe;
 static FifoCpuProbe s_fifo_read_probe,s_fifo_emit_probe;
+static struct {uint64_t samples;double ms;} s_fifo_emit_kind[6];
 static double pb_wall_ms(void)
 {
 #if defined(_WIN32)
@@ -87,11 +88,12 @@ static int fifo_cpu_probe_begin(FifoCpuProbe *p,double *begin)
     if(x&63u)return 0;
     *begin=pb_wall_ms();return 1;
 }
-static void fifo_cpu_probe_end(FifoCpuProbe *p,double begin)
+static double fifo_cpu_probe_end(FifoCpuProbe *p,double begin)
 {
     double elapsed=pb_wall_ms()-begin;
     ++p->samples;p->sample_ms+=elapsed;
     if(elapsed>p->peak_ms)p->peak_ms=elapsed;
+    return elapsed;
 }
 static void note(uint32_t subch, uint32_t method)
 {
@@ -201,6 +203,11 @@ void nv2a_pb_scan_report(void)
         memset(&s_fifo_read_probe,0,sizeof s_fifo_read_probe);
         memset(&s_fifo_emit_probe,0,sizeof s_fifo_emit_probe);
         s_fifo_read_probe.rng=read_rng;s_fifo_emit_probe.rng=emit_rng;
+        const char *kinds[6]={"draw_data","transform_constants","transform_program","textures","surface","other"};
+        for(unsigned kind=0;kind<6;kind++)fprintf(stderr,"[GPU-FIFO-KIND] kind=%s samples=%llu sample_ms=%.6f est_ms=%.3f sample_rate=64\n",
+            kinds[kind],(unsigned long long)s_fifo_emit_kind[kind].samples,
+            s_fifo_emit_kind[kind].ms,s_fifo_emit_kind[kind].ms*64.0);
+        memset(s_fifo_emit_kind,0,sizeof s_fifo_emit_kind);
         s_fifo_ms=0;s_fifo_words=s_fifo_parameters=s_fifo_polls=0;
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
@@ -329,7 +336,17 @@ static void fifo_emit(uint32_t subch,uint32_t method,uint32_t param)
     ++s_fifo_parameters;
     double begin=0;int sample=fifo_cpu_probe_begin(&s_fifo_emit_probe,&begin);
     note(subch,method);nv2a_pb_exec_method(subch,method,param);
-    if(sample)fifo_cpu_probe_end(&s_fifo_emit_probe,begin);
+    if(sample){
+        double ms=fifo_cpu_probe_end(&s_fifo_emit_probe,begin);
+        unsigned kind;
+        if((method>=0x17FC && method<=0x1810))kind=0;
+        else if(method>=0x0B80 && method<0x0C00)kind=1;
+        else if(method>=0x0B00 && method<0x0B80)kind=2;
+        else if(method>=0x1B00 && method<0x1C00)kind=3;
+        else if(method>=0x0200 && method<=0x0214)kind=4;
+        else kind=5;
+        ++s_fifo_emit_kind[kind].samples;s_fifo_emit_kind[kind].ms+=ms;
+    }
 }
 uint32_t nv2a_pb_execute_fifo(uint32_t get,uint32_t put,uint32_t lo,uint32_t hi)
 {

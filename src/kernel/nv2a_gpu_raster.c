@@ -1058,21 +1058,32 @@ static int gpu_target_buffers(unsigned bytes)
     return 1;
 }
 #include "nv2a_gpu_target_resume.inc"
+typedef struct {uint64_t switches,queued,sync,empty;} GpuTargetFlow;
+static GpuTargetFlow s_target_flow[4][4];
 static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned stride)
 {
     if(g.active && (g.host_color!=color || g.host_depth!=depth || g.depth_stride!=stride ||
        g.target.width!=s->width || g.target.height!=s->height || g.target.pitch!=s->pitch ||
        g.target.bpp!=s->bpp || g.target.format!=s->format)) {
+        GpuTargetFlow *flow=NULL;
+        if(!g.selftest){
+            flow=&s_target_flow[gpu_target_shape(g.target.width,g.target.height)]
+                               [gpu_target_shape(s->width,s->height)];
+            ++flow->switches;
+        }
         int queued=0;
         /* A bind with no writes has no new GPU pixels or visibility results.
          * Its CPU mirror is already authoritative, so do not queue a copy. */
         if(!g.selftest && !s_capture && !g.target_written && !g.queued_count && !g.stats_required){
             ++g.target_shape[gpu_target_shape(g.target.width,g.target.height)].empty_skips;
+            if(flow)++flow->empty;
             g.active=g.resident=0;
         } else if(g.native && g.readback_queue && (!g.selftest || g.readback_queue_test) && !s_capture)
             queued=gpu_queue_readback();
         if(queued<0)return -1;
+        if(flow && queued)++flow->queued;
         if(g.active){
+            if(flow && !queued)++flow->sync;
             if(!queued && !gpu_readback("target-change"))return -1;
         }
     }
@@ -1636,12 +1647,26 @@ int nv_gpu_reset_report(void)
     if(!g.selftest && submitted)++g.report_resets;
     return 1;
 }
+typedef struct {uint32_t rng;uint64_t calls,samples;double phase[6];} GpuReserveProbe;
+static GpuReserveProbe s_reserve_probe;
+static int gpu_reserve_probe_begin(void)
+{
+    static int enabled=-1;
+    if(enabled<0){const char *e=getenv("RECOMP_RENDER_TIMING");enabled=e && atoi(e)>0;}
+    if(!enabled || g.selftest)return 0;
+    uint32_t x=s_reserve_probe.rng;
+    if(!x)x=0x74234c0du;
+    x^=x<<13;x^=x>>17;x^=x<<5;s_reserve_probe.rng=x;
+    return (x&63u)==0;
+}
 static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
                 uint8_t *color,float *depth,unsigned stride,const NvGpuTextureSource texture[4],int raw_reserve,int raw_use_rc)
 {
     if(!nv_gpu_available())return 0;
     if(!gpu_capture_begin())return -1;
     double begin=gpu_ms();unsigned refs=0;
+    int probe=raw_reserve && gpu_reserve_probe_begin();
+    double probe_begin=probe?begin:0,probe_phase[6]={0};
     if(!color || !n || n>NV_GPU_MAX_TRIANGLES || !s->width || !s->height ||
        s->width>1024 || s->height>1024 || (s->bpp!=2 && s->bpp!=4))goto fallback;
     int simple=g.native?g.simple_pixel_shader!=NULL:g.simple_shader!=NULL;
@@ -1702,11 +1727,13 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
             }
         }
     }
+    if(probe){double now=gpu_ms();probe_phase[0]=now-probe_begin;probe_begin=now;}
     double phase=gpu_ms();
     int target=gpu_target(s,color,depth,stride);
     if(!g.selftest)g.target_ms+=gpu_ms()-phase;
     if(target<0)return -1;
     if(!target)goto fallback;
+    if(probe){double now=gpu_ms();probe_phase[1]=now-probe_begin;probe_begin=now;}
     if((g.queued_count && (!g.native || !g.native_batch) && g.queue_simple!=simple) ||
        g.queued_count+n>NV_GPU_MAX_TRIANGLES || g.state_count==NV_GPU_MAX_STATES ||
        g.queued_refs+refs>NV_GPU_MAX_REFERENCES) {
@@ -1716,6 +1743,7 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
         if((!gpu_bridge_source(&s->tex[i],&texture[i]) && !gpu_pending_access(texture[i].raw,texture[i].bytes)) ||
            !gpu_pending_access(texture[i].palette,texture[i].palette_bytes))return -1;
     }
+    if(probe){double now=gpu_ms();probe_phase[2]=now-probe_begin;probe_begin=now;}
     ++g.tick;
     NvGpuState next=*s;phase=gpu_ms();
     for(int i=0;i<4;i++) {
@@ -1728,6 +1756,7 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
         }
     }
     if(!g.selftest)g.texture_ms+=gpu_ms()-phase;
+    if(probe){double now=gpu_ms();probe_phase[3]=now-probe_begin;probe_begin=now;}
     /* Texture replacement above may have dispatched the earlier queue. */
     g.queue_simple=simple;
     unsigned index=g.state_count;
@@ -1745,6 +1774,7 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
             ++g.state_intern_misses;
         }
     }else{++g.state_count;g.queued_state[index]=next;}
+    if(probe){double now=gpu_ms();probe_phase[4]=now-probe_begin;probe_begin=now;}
     for(unsigned i=0;i<n;i++) {
         g.queued_kind[g.queued_count+i]=(uint8_t)simple;
         raw.slots[g.queued_count+i]=0;
@@ -1762,6 +1792,13 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
     g.queued_count+=n;g.queued_refs+=refs;
     for(int i=0;i<4;i++)if(g.bound[i])g.bound[i]->queued=1;
     if(!g.selftest){++g.draws;g.tris+=n;g.submit_ms+=gpu_ms()-begin;}
+    if(raw_reserve) {
+        ++s_reserve_probe.calls;
+        if(probe){
+            probe_phase[5]=gpu_ms()-probe_begin;++s_reserve_probe.samples;
+            for(unsigned i=0;i<6;i++)s_reserve_probe.phase[i]+=probe_phase[i];
+        }
+    }
     return 1;
 fallback:
     if(!g.selftest)++g.fallbacks;
@@ -3062,6 +3099,22 @@ void nv_gpu_report(void)
             (unsigned long long)g.target_shape[shape].empty_skips);
     }
     memset(g.target_shape,0,sizeof g.target_shape);
+    const char *shape_names[4]={"640x480","256x256","128x128","other"};
+    for(unsigned from=0;from<4;from++)for(unsigned to=0;to<4;to++){
+        GpuTargetFlow *flow=&s_target_flow[from][to];
+        if(flow->switches)fprintf(stderr,"[GPU-TARGET-FLOW] from=%s to=%s switches=%llu queued=%llu sync=%llu empty=%llu\n",
+            shape_names[from],shape_names[to],(unsigned long long)flow->switches,
+            (unsigned long long)flow->queued,(unsigned long long)flow->sync,(unsigned long long)flow->empty);
+    }
+    memset(s_target_flow,0,sizeof s_target_flow);
+    double reserve_scale=s_reserve_probe.samples?(double)s_reserve_probe.calls/s_reserve_probe.samples:0;
+    fprintf(stderr,"[GPU-RESERVE-CPU] accepted=%llu samples=%llu preflight_est_ms=%.3f target_est_ms=%.3f dependencies_est_ms=%.3f texture_est_ms=%.3f state_est_ms=%.3f queue_est_ms=%.3f sample_rate=64\n",
+        (unsigned long long)s_reserve_probe.calls,(unsigned long long)s_reserve_probe.samples,
+        s_reserve_probe.phase[0]*reserve_scale,s_reserve_probe.phase[1]*reserve_scale,
+        s_reserve_probe.phase[2]*reserve_scale,s_reserve_probe.phase[3]*reserve_scale,
+        s_reserve_probe.phase[4]*reserve_scale,s_reserve_probe.phase[5]*reserve_scale);
+    uint32_t reserve_rng=s_reserve_probe.rng;
+    memset(&s_reserve_probe,0,sizeof s_reserve_probe);s_reserve_probe.rng=reserve_rng;
     fprintf(stderr,"[GPU-COMBINER] vector_writes=%u registers=%s\n",(unsigned)(g.native && !g.array_registers && g.vector_combiner),g.array_registers?"array":"named");
     fprintf(stderr,"[GPU-SAMPLING] shared_addresses=%u\n",(unsigned)(g.native && g.quad_sampling));
     gpu_literal_report();
