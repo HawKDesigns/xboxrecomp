@@ -402,7 +402,7 @@ int nv_gpu_geometry_available(void)
     return (InterlockedCompareExchange(&s_startup,0,0)==2 || gpu_startup_owned()) && raw.ready && g.native && g.coverage && g.native_batch &&
         (!g.selftest || raw.testing) && !g.auto_enabled && !s_capture && !InterlockedCompareExchange(&s_capture_requested,0,0);
 }
-int nv_gpu_draw_raw(const NvGpuState *state,const NvRawInput *in,uint8_t *color,float *depth,unsigned stride,const NvGpuTextureSource texture[4])
+static int gpu_draw_raw_impl(const NvGpuState *state,const NvRawInput *in,uint8_t *color,float *depth,unsigned stride,const NvGpuTextureSource texture[4])
 {
     if(!nv_gpu_geometry_available() || !in->count || in->count>4096 || !in->vertices || in->vertices>4096 ||
        in->program_id>=raw.program_count || (in->position_kind!=1 && in->position_kind!=2))return 0;
@@ -424,6 +424,8 @@ int nv_gpu_draw_raw(const NvGpuState *state,const NvRawInput *in,uint8_t *color,
     if(raw.count==NV_RAW_DRAWS || raw.vertex_count+m->vertices>NV_RAW_VERTICES)
         if(!gpu_flush())return -1;
     if(raw_fast_reserve<0){const char *e=getenv("RECOMP_GPU_RAW_FAST_RESERVE");raw_fast_reserve=!e || atoi(e)>0;}
+    double reserve_begin=0;int reserve_sample=!g.selftest && raw.profile_enabled?
+        gpu_raw_profile_begin(3,&reserve_begin):0;
     int accepted;
     if(raw_fast_reserve)accepted=nv_gpu_reserve_raw(state,m->triangles,in->params.use_rc,color,depth,stride,texture);
     else {
@@ -434,7 +436,11 @@ int nv_gpu_draw_raw(const NvGpuState *state,const NvRawInput *in,uint8_t *color,
         }
         accepted=nv_gpu_draw(state,placeholders,m->triangles,color,depth,stride,texture);
     }
+    if(!g.selftest && raw.profile_enabled)
+        gpu_raw_profile_end(3,accepted==1?0:(accepted<0?2:1),reserve_sample,reserve_begin);
     if(accepted!=1)return accepted;
+    double bookkeeping_begin=0;int bookkeeping_sample=!g.selftest && raw.profile_enabled?
+        gpu_raw_profile_begin(4,&bookkeeping_begin):0;
     if(raw_fast_reserve && !g.selftest){++raw.reserved_draws;raw.reserved_triangles+=m->triangles;}
     unsigned at=raw.count++,base=g.queued_count-m->triangles;
     NvRawDraw *draw=&raw.draws[at];memcpy(draw->constants,in->constants,sizeof draw->constants);draw->p=in->params;
@@ -445,7 +451,17 @@ int nv_gpu_draw_raw(const NvGpuState *state,const NvRawInput *in,uint8_t *color,
     if(in->params.left<g.dirty_left)g.dirty_left=in->params.left;if(in->params.right>g.dirty_right)g.dirty_right=in->params.right;
     if(in->params.top<g.dirty_top)g.dirty_top=in->params.top;if(in->params.bottom>g.dirty_bottom)g.dirty_bottom=in->params.bottom;
     if(!g.selftest){++raw.draws_queued;raw.vertices_queued+=m->vertices;raw.triangles_queued+=m->triangles;}
+    if(!g.selftest && raw.profile_enabled)
+        gpu_raw_profile_end(4,0,bookkeeping_sample,bookkeeping_begin);
     return 1;
+}
+int nv_gpu_draw_raw(const NvGpuState *state,const NvRawInput *in,uint8_t *color,float *depth,unsigned stride,const NvGpuTextureSource texture[4])
+{
+    if(g.selftest || !raw.profile_enabled)return gpu_draw_raw_impl(state,in,color,depth,stride,texture);
+    double begin=0;int sample=gpu_raw_profile_begin(5,&begin);
+    int result=gpu_draw_raw_impl(state,in,color,depth,stride,texture);
+    gpu_raw_profile_end(5,result==1?0:(result==2?1:2),sample,begin);
+    return result;
 }
 static int gpu_raw_upload(GpuBuffer *triangles)
 {

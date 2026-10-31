@@ -44,7 +44,7 @@ static struct {
     uint64_t cache_slot_evictions,cache_host_evictions,cache_atlas_evictions;
     unsigned stream_union,stream_union_rejected;
     unsigned word_hash;
-    unsigned profile_enabled;NvRawProfile profile[3];
+    unsigned profile_enabled;NvRawProfile profile[6];
     int point_bounds_enabled;
     uint64_t point_attempted,point_inside,point_outside,point_large,point_unsafe;
     struct {uint64_t lookups,overlapped,logical,unique,copy_legacy,copied,upload_legacy,uploaded;} stream_bytes;

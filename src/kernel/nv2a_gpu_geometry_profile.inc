@@ -41,9 +41,12 @@ static int gpu_raw_profile_resident(NvRawMesh *m)
 }
 static void gpu_raw_profile_report(void)
 {
-    static const char *phase[3]={"mesh","bounds","resident"};
-    static const char *outcome[3][3]={{"hit","built","failed"},{"inside","outside","cpu_fallback"},{"reused","uploaded","failed"}};
-    for(unsigned i=0;i<3;i++){
+    static const char *phase[6]={"mesh","bounds","resident","reserve","bookkeeping","total"};
+    static const char *outcome[6][3]={
+        {"hit","built","failed"},{"inside","outside","cpu_fallback"},
+        {"reused","uploaded","failed"},{"accepted","fallback","failed"},
+        {"queued","unused","failed"},{"accepted","culled","fallback"}};
+    for(unsigned i=0;i<6;i++){
         NvRawProfile *p=&raw.profile[i];
         for(unsigned j=0;j<3;j++)fprintf(stderr,"[GPU-GEOMETRY-CPU] enabled=%u phase=%s outcome=%s calls=%llu samples=%llu sample_ms=%.6f sample_peak_ms=%.6f sample_rate=64\n",
             raw.profile_enabled,phase[i],outcome[i][j],(unsigned long long)p->calls[j],(unsigned long long)p->samples[j],p->ms[j],p->peak_ms[j]);

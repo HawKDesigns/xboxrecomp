@@ -50,6 +50,15 @@ static struct {
     uint64_t batch_flushes, queued_jobs, parallel_triangles;
     uint64_t vertex_runs,vertex_reuses;
 } s_render_time;
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+/* Sparse CPU samples keep the timing probe itself out of most draw calls.
+ * Outcomes remain exact; times are sampled, not full-window totals. */
+static struct {
+    uint32_t rng;
+    uint64_t calls[3],samples[3];
+    double total_ms[3],setup_ms[3],submit_ms[3],peak_ms[3];
+} s_raw_batch_probe;
+#endif
 static int render_timing_enabled(void)
 {
     static int enabled = -1;
@@ -2803,7 +2812,7 @@ static int transform_vertices(uint32_t n,int reuse,uint32_t *runs)
 }
 
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
-static int gpu_try_raw_geometry(uint32_t n)
+static int gpu_try_raw_geometry_impl(uint32_t n,int sampled,double started,double *setup_ms,int *outcome)
 {
     if(!nv_gpu_geometry_available() || !n || n>NV_MAX_INDICES)return 0;
     Nv2aVshSnapshot snapshot;if(!nv2a_vsh_snapshot(&snapshot))return 0;
@@ -2845,11 +2854,38 @@ static int gpu_try_raw_geometry(uint32_t n)
     p->fog_enable=s_gpu.fog_enable;p->fog_mode=s_gpu.fog_mode;p->fog_x=s_gpu.fog_param[0];p->fog_y=s_gpu.fog_param[1];
     nv2a_rc_unpack(s_gpu.fog_color,p->fog_color);{float r=p->fog_color[2];p->fog_color[2]=p->fog_color[0];p->fog_color[0]=r;}
     in.zmin=s_gpu.clip_z_min;in.zmax=s_gpu.clip_z_max;in.zclip=s_gpu.clip_z_seen==3 && isfinite(in.zmin) && isfinite(in.zmax) && in.zmin<=in.zmax;
+    if(sampled)*setup_ms=render_wall_ms()-started;
     int result=nv_gpu_draw_raw(&state,&in,s_surface,first.zb,NV_ZBUF_W,sources);
+    *outcome=result;
     if(result<0){fprintf(stderr,"[GPU-GEOMETRY] accepted geometry submission failed\n");exit(4);}
     if(result==2){++s_frustum_draws;s_frustum_vertices+=n;}
     else if(result==1){s_gpu.batches_program++;s_gpu.verts_program+=n;note_drawn();}
     return result!=0;
+}
+static int gpu_try_raw_geometry(uint32_t n)
+{
+    if(!render_timing_enabled()){
+        int outcome=0;
+        return gpu_try_raw_geometry_impl(n,0,0,NULL,&outcome);
+    }
+    uint32_t x=s_raw_batch_probe.rng;
+    if(!x)x=0x13e5a7d9u;
+    x^=x<<13;x^=x>>17;x^=x<<5;s_raw_batch_probe.rng=x;
+    int sampled=(x&63u)==0,outcome=0;
+    double started=sampled?render_wall_ms():0,setup=-1;
+    int result=gpu_try_raw_geometry_impl(n,sampled,started,&setup,&outcome);
+    unsigned bucket=outcome==1?0:(outcome==2?1:2);
+    ++s_raw_batch_probe.calls[bucket];
+    if(sampled){
+        double total=render_wall_ms()-started;
+        if(setup<0)setup=total;
+        ++s_raw_batch_probe.samples[bucket];
+        s_raw_batch_probe.total_ms[bucket]+=total;
+        s_raw_batch_probe.setup_ms[bucket]+=setup;
+        s_raw_batch_probe.submit_ms[bucket]+=total-setup;
+        if(total>s_raw_batch_probe.peak_ms[bucket])s_raw_batch_probe.peak_ms[bucket]=total;
+    }
+    return result;
 }
 #endif
 static void raster_batch_program(void)
@@ -4295,6 +4331,18 @@ void nv2a_pb_exec_report(void)
             (unsigned long long)s_render_time.queued_jobs,
             (unsigned long long)s_render_time.parallel_triangles,
             (unsigned long long)s_render_time.vertex_runs,(unsigned long long)s_render_time.vertex_reuses,s_render_time.batch_ms,s_render_time.fixed_ms);
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        static const char *raw_outcomes[3]={"accepted","culled","fallback"};
+        for(unsigned i=0;i<3;i++)fprintf(stderr,
+            "[PB-RAW-CPU] outcome=%s calls=%llu samples=%llu setup_sample_ms=%.6f submit_sample_ms=%.6f total_sample_ms=%.6f peak_ms=%.6f sample_rate=64\n",
+            raw_outcomes[i],(unsigned long long)s_raw_batch_probe.calls[i],
+            (unsigned long long)s_raw_batch_probe.samples[i],
+            s_raw_batch_probe.setup_ms[i],s_raw_batch_probe.submit_ms[i],
+            s_raw_batch_probe.total_ms[i],s_raw_batch_probe.peak_ms[i]);
+        uint32_t raw_rng=s_raw_batch_probe.rng;
+        memset(&s_raw_batch_probe,0,sizeof s_raw_batch_probe);
+        s_raw_batch_probe.rng=raw_rng;
+#endif
         memset(&s_render_time, 0, sizeof s_render_time);
     }
     fprintf(stderr, "[GPU] cull enabled=%u face=%04X front=%04X culled=%u\n",

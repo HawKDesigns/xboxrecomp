@@ -66,6 +66,8 @@ static int s_exec_enabled = -1;
 static int s_fifo_timing=-1;
 static double s_fifo_ms;
 static uint64_t s_fifo_parameters,s_fifo_words,s_fifo_polls;
+typedef struct {uint32_t rng;uint64_t calls,samples;double sample_ms,peak_ms;} FifoCpuProbe;
+static FifoCpuProbe s_fifo_read_probe,s_fifo_emit_probe;
 static double pb_wall_ms(void)
 {
 #if defined(_WIN32)
@@ -76,6 +78,21 @@ static double pb_wall_ms(void)
 #endif
 }
 
+static int fifo_cpu_probe_begin(FifoCpuProbe *p,double *begin)
+{
+    ++p->calls;
+    if(s_fifo_timing<=0)return 0;
+    uint32_t x=p->rng;if(!x)x=0xc18b49e7u;
+    x^=x<<13;x^=x>>17;x^=x<<5;p->rng=x;
+    if(x&63u)return 0;
+    *begin=pb_wall_ms();return 1;
+}
+static void fifo_cpu_probe_end(FifoCpuProbe *p,double begin)
+{
+    double elapsed=pb_wall_ms()-begin;
+    ++p->samples;p->sample_ms+=elapsed;
+    if(elapsed>p->peak_ms)p->peak_ms=elapsed;
+}
 static void note(uint32_t subch, uint32_t method)
 {
     if(s_inventory_enabled<0)s_inventory_enabled=getenv("RECOMP_PB_SCAN")!=NULL;
@@ -170,6 +187,20 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         if(s_fifo_timing>0)fprintf(stderr,"[GPU-FIFO] execute_ms=%.3f words=%llu parameters=%llu polls=%llu inventory=%d lookup=%s\n",
             s_fifo_ms,(unsigned long long)s_fifo_words,(unsigned long long)s_fifo_parameters,(unsigned long long)s_fifo_polls,s_seen_count,s_inventory_enabled>0?"direct":"disabled");
+        double read_est=s_fifo_read_probe.samples?
+            s_fifo_read_probe.sample_ms*(double)s_fifo_read_probe.calls/s_fifo_read_probe.samples:0;
+        double emit_est=s_fifo_emit_probe.samples?
+            s_fifo_emit_probe.sample_ms*(double)s_fifo_emit_probe.calls/s_fifo_emit_probe.samples:0;
+        fprintf(stderr,"[GPU-FIFO-CPU] reads=%llu read_samples=%llu read_sample_ms=%.6f read_est_ms=%.3f read_peak_ms=%.6f emits=%llu emit_samples=%llu emit_sample_ms=%.6f emit_est_ms=%.3f emit_peak_ms=%.6f decode_residual_est_ms=%.3f sample_rate=64\n",
+            (unsigned long long)s_fifo_read_probe.calls,(unsigned long long)s_fifo_read_probe.samples,
+            s_fifo_read_probe.sample_ms,read_est,s_fifo_read_probe.peak_ms,
+            (unsigned long long)s_fifo_emit_probe.calls,(unsigned long long)s_fifo_emit_probe.samples,
+            s_fifo_emit_probe.sample_ms,emit_est,s_fifo_emit_probe.peak_ms,
+            s_fifo_ms-read_est-emit_est);
+        uint32_t read_rng=s_fifo_read_probe.rng,emit_rng=s_fifo_emit_probe.rng;
+        memset(&s_fifo_read_probe,0,sizeof s_fifo_read_probe);
+        memset(&s_fifo_emit_probe,0,sizeof s_fifo_emit_probe);
+        s_fifo_read_probe.rng=read_rng;s_fifo_emit_probe.rng=emit_rng;
         s_fifo_ms=0;s_fifo_words=s_fifo_parameters=s_fifo_polls=0;
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
@@ -287,13 +318,18 @@ static int fifo_read(uint32_t address,uint32_t *word)
 {
     extern int xbox_Nv2aFifoRead(uint32_t,uint32_t*);
     /* A command stream can alias a deferred semaphore destination too. */
+    double begin=0;int sample=fifo_cpu_probe_begin(&s_fifo_read_probe,&begin);
     nv2a_pb_exec_guest_access(address,4);
-    return xbox_Nv2aFifoRead(address,word);
+    int ok=xbox_Nv2aFifoRead(address,word);
+    if(sample)fifo_cpu_probe_end(&s_fifo_read_probe,begin);
+    return ok;
 }
 static void fifo_emit(uint32_t subch,uint32_t method,uint32_t param)
 {
     ++s_fifo_parameters;
+    double begin=0;int sample=fifo_cpu_probe_begin(&s_fifo_emit_probe,&begin);
     note(subch,method);nv2a_pb_exec_method(subch,method,param);
+    if(sample)fifo_cpu_probe_end(&s_fifo_emit_probe,begin);
 }
 uint32_t nv2a_pb_execute_fifo(uint32_t get,uint32_t put,uint32_t lo,uint32_t hi)
 {
