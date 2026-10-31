@@ -3692,6 +3692,40 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     subch, method, param);
     }
 
+    /* Hot draw-data methods dominate FIFO emission in QPR2. They have no
+     * per-method trace output, so handle them before the general method
+     * switch and its texture/subchannel dispatch. Keep the old switch as an
+     * exact same-build fallback for comparison. */
+    if(subch==0 && (method==NV097_ARRAY_ELEMENT16 ||
+                    method==NV097_ARRAY_ELEMENT32 ||
+                    method==NV097_INLINE_ARRAY ||
+                    method==NV097_DRAW_ARRAYS)) {
+        static int fast_array=-1;
+        if(fast_array<0){const char *e=getenv("RECOMP_PB_FAST_ARRAYS");fast_array=!e || atoi(e)>0;}
+        if(fast_array) {
+            if(method==NV097_ARRAY_ELEMENT16) {
+                if(s_gpu.prim && s_gpu.idx_count+2<=NV_MAX_INDICES) {
+                    s_gpu.idx[s_gpu.idx_count++]=(uint16_t)(param&0xFFFF);
+                    s_gpu.idx[s_gpu.idx_count++]=(uint16_t)(param>>16);
+                } else if(s_gpu.prim)s_gpu.idx_dropped+=2;
+            } else if(method==NV097_ARRAY_ELEMENT32) {
+                if(s_gpu.prim && s_gpu.idx_count<NV_MAX_INDICES){
+                    s_gpu.idx[s_gpu.idx_count++]=param;++s_gpu.idx32_appended;
+                } else if(s_gpu.prim)++s_gpu.idx_dropped;
+            } else if(method==NV097_INLINE_ARRAY) {
+                if(s_gpu.prim && s_gpu.inline_count<NV_MAX_INLINE)
+                    s_gpu.inline_buf[s_gpu.inline_count++]=param;
+            } else if(s_gpu.prim) {
+                uint32_t start=param&0x00FFFFFFu;
+                uint32_t count=((param>>24)&0xFFu)+1u,i;
+                for(i=0;i<count && s_gpu.idx_count<NV_MAX_INDICES;i++)
+                    s_gpu.idx[s_gpu.idx_count++]=start+i;
+                s_gpu.idx_dropped+=count-i;
+            }
+            return;
+        }
+    }
+
     if (s_ftrace == 2) {
         /* RECOMP_FRAME_TRACE_METHODS: every method of the traced frame,
          * less the bulk (vertex data, program and constant uploads). */

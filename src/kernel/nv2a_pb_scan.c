@@ -68,7 +68,7 @@ static double s_fifo_ms;
 static uint64_t s_fifo_parameters,s_fifo_words,s_fifo_polls;
 typedef struct {uint32_t rng;uint64_t calls,samples;double sample_ms,peak_ms;} FifoCpuProbe;
 static FifoCpuProbe s_fifo_read_probe,s_fifo_emit_probe;
-static struct {uint64_t samples;double ms;} s_fifo_emit_kind[6];
+static struct {uint64_t samples;double ms;} s_fifo_emit_kind[10];
 static double pb_wall_ms(void)
 {
 #if defined(_WIN32)
@@ -203,8 +203,8 @@ void nv2a_pb_scan_report(void)
         memset(&s_fifo_read_probe,0,sizeof s_fifo_read_probe);
         memset(&s_fifo_emit_probe,0,sizeof s_fifo_emit_probe);
         s_fifo_read_probe.rng=read_rng;s_fifo_emit_probe.rng=emit_rng;
-        const char *kinds[6]={"draw_data","transform_constants","transform_program","textures","surface","other"};
-        for(unsigned kind=0;kind<6;kind++)fprintf(stderr,"[GPU-FIFO-KIND] kind=%s samples=%llu sample_ms=%.6f est_ms=%.3f sample_rate=64\n",
+        const char *kinds[10]={"index16","index32","inline","draw_arrays","begin_end","transform_constants","transform_program","textures","surface","other"};
+        for(unsigned kind=0;kind<10;kind++)fprintf(stderr,"[GPU-FIFO-KIND] kind=%s samples=%llu sample_ms=%.6f est_ms=%.3f sample_rate=64\n",
             kinds[kind],(unsigned long long)s_fifo_emit_kind[kind].samples,
             s_fifo_emit_kind[kind].ms,s_fifo_emit_kind[kind].ms*64.0);
         memset(s_fifo_emit_kind,0,sizeof s_fifo_emit_kind);
@@ -339,12 +339,16 @@ static void fifo_emit(uint32_t subch,uint32_t method,uint32_t param)
     if(sample){
         double ms=fifo_cpu_probe_end(&s_fifo_emit_probe,begin);
         unsigned kind;
-        if((method>=0x17FC && method<=0x1810))kind=0;
-        else if(method>=0x0B80 && method<0x0C00)kind=1;
-        else if(method>=0x0B00 && method<0x0B80)kind=2;
-        else if(method>=0x1B00 && method<0x1C00)kind=3;
-        else if(method>=0x0200 && method<=0x0214)kind=4;
-        else kind=5;
+        if(method==0x1800)kind=0;
+        else if(method==0x1808)kind=1;
+        else if(method==0x1818)kind=2;
+        else if(method==0x1810)kind=3;
+        else if(method==0x17FC)kind=4;
+        else if(method>=0x0B80 && method<0x0C00)kind=5;
+        else if(method>=0x0B00 && method<0x0B80)kind=6;
+        else if(method>=0x1B00 && method<0x1C00)kind=7;
+        else if(method>=0x0200 && method<=0x0214)kind=8;
+        else kind=9;
         ++s_fifo_emit_kind[kind].samples;s_fifo_emit_kind[kind].ms+=ms;
     }
 }
