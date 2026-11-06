@@ -160,6 +160,7 @@ static struct {
     uint64_t queued_readbacks,pending_peak,pending_dependencies,pending_capacity;
     uint64_t pending_fast_empty,pending_range_checks;
     double pending_submit_ms;
+    struct {uint64_t drains;double wait_ms;} dependency_source[6][4];
     struct {uint64_t binds,queued,readbacks,pixels,empty_skips;double map_wait_ms;} target_shape[4];
     struct {
         int enabled,unpublished,feedback_enabled;
@@ -292,7 +293,7 @@ static void gpu_capture_data(const void *data,size_t bytes)
 }
 static int gpu_readback(const char *reason);
 static int gpu_pending_drain(void);
-static int gpu_pending_access(const void *address,size_t bytes);
+static int gpu_pending_access(const void *address,size_t bytes,unsigned origin);
 static int gpu_queue_readback(void);
 static int gpu_backend_benchmark(void);
 static GpuPendingReadback *gpu_bridge_source(const NvGpuTexture*,const NvGpuTextureSource*);
@@ -622,7 +623,28 @@ static int gpu_canonical_overlap(uintptr_t address,size_t bytes,
     if(bytes>UINTPTR_MAX-address || other_bytes>UINTPTR_MAX-other)return 1;
     return address<other+other_bytes && other<address+bytes;
 }
-static int gpu_pending_access(const void *address,size_t bytes)
+enum {
+    GPU_DEP_GUEST_ACCESS,
+    GPU_DEP_GUEST_READ,
+    GPU_DEP_TARGET_COLOR,
+    GPU_DEP_TARGET_DEPTH,
+    GPU_DEP_TEXTURE_RAW,
+    GPU_DEP_TEXTURE_PALETTE
+};
+/* Identify the producer of a forced target publication without changing
+ * the ordering or contents of the pending readback queue. */
+static int gpu_pending_dependency(unsigned origin,const GpuPendingReadback *p)
+{
+    unsigned shape=gpu_target_shape(p->target.width,p->target.height);
+    double begin=gpu_ms();
+    int result=gpu_pending_drain();
+    if(!g.selftest) {
+        ++g.dependency_source[origin][shape].drains;
+        g.dependency_source[origin][shape].wait_ms+=gpu_ms()-begin;
+    }
+    return result;
+}
+static int gpu_pending_access(const void *address,size_t bytes,unsigned origin)
 {
     if(!g.fast_pending_access){
         for(unsigned i=0;i<g.pending_count;i++) {
@@ -630,7 +652,7 @@ static int gpu_pending_access(const void *address,size_t bytes)
             if(gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
                gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride))) {
                 if(!g.selftest)++g.pending_dependencies;
-                return gpu_pending_drain();
+                return gpu_pending_dependency(origin,p);
             }
         }
         return 1;
@@ -651,7 +673,7 @@ static int gpu_pending_access(const void *address,size_t bytes)
              gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride)));
         if(overlap) {
             if(!g.selftest)++g.pending_dependencies;
-            return gpu_pending_drain();
+            return gpu_pending_dependency(origin,p);
         }
     }
     return 1;
@@ -667,7 +689,7 @@ int nv_gpu_guest_access(uint64_t address,uint64_t bytes)
         return ((g.resume.active || g.completion.unpublished) && g.active?
             gpu_readback("completion-invalid-access"):gpu_pending_drain())?1:-1;
     const void *p=(const void*)(base+(uintptr_t)address);
-    if(!gpu_pending_access(p,(size_t)bytes))return -1;
+    if(!gpu_pending_access(p,(size_t)bytes,GPU_DEP_GUEST_ACCESS))return -1;
     /* A resumed target can have an older queued version at the same address.
      * A real CPU access must observe its latest active writes, including when
      * another dependency has already consumed that older queued version. */
@@ -686,7 +708,7 @@ int nv_gpu_guest_read(uint64_t address,uint64_t bytes)
     if(address>UINT32_MAX || bytes>0x100000000ull-address || address>UINTPTR_MAX-base || bytes>SIZE_MAX)
         return gpu_readback("completion-chain-invalid")?1:-1;
     const void *p=(const void*)(base+(uintptr_t)address);
-    if(!gpu_pending_access(p,(size_t)bytes))return -1;
+    if(!gpu_pending_access(p,(size_t)bytes,GPU_DEP_GUEST_READ))return -1;
     if(g.active && (gpu_host_overlap(p,(size_t)bytes,g.host_color,gpu_target_color_bytes(&g.target)) ||
        gpu_host_overlap(p,(size_t)bytes,g.host_depth,gpu_target_depth_bytes(&g.target,g.depth_stride))))
         return gpu_readback_current("completion-chain-read")?1:-1;
@@ -1093,8 +1115,8 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
         if(resumed>0){g.seed.snapshot_valid=0;g.seed.depth_dirty=1;}
         return resumed>0?1:0;
     }
-    if(!gpu_pending_access(color,gpu_target_color_bytes(s)) ||
-       (depth && !gpu_pending_access(depth,gpu_target_depth_bytes(s,stride))))return -1;
+    if(!gpu_pending_access(color,gpu_target_color_bytes(s),GPU_DEP_TARGET_COLOR) ||
+       (depth && !gpu_pending_access(depth,gpu_target_depth_bytes(s,stride),GPU_DEP_TARGET_DEPTH)))return -1;
     double bind_begin=gpu_ms();
     if(g.native && !gpu_native_target(s->width,s->height))return 0;
     unsigned bytes=s->width*s->height*4;
@@ -1740,8 +1762,8 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
         if(!gpu_flush())return -1;
     }
     for(unsigned i=0;i<4;i++)if(s->tex[i].valid) {
-        if((!gpu_bridge_source(&s->tex[i],&texture[i]) && !gpu_pending_access(texture[i].raw,texture[i].bytes)) ||
-           !gpu_pending_access(texture[i].palette,texture[i].palette_bytes))return -1;
+        if((!gpu_bridge_source(&s->tex[i],&texture[i]) && !gpu_pending_access(texture[i].raw,texture[i].bytes,GPU_DEP_TEXTURE_RAW)) ||
+           !gpu_pending_access(texture[i].palette,texture[i].palette_bytes,GPU_DEP_TEXTURE_PALETTE))return -1;
     }
     if(probe){double now=gpu_ms();probe_phase[2]=now-probe_begin;probe_begin=now;}
     ++g.tick;
@@ -3198,6 +3220,24 @@ void nv_gpu_report(void)
     fprintf(stderr,"[GPU-PENDING-ACCESS] enabled=%u empty=%llu range_checks=%llu\n",
         (unsigned)g.fast_pending_access,(unsigned long long)g.pending_fast_empty,
         (unsigned long long)g.pending_range_checks);
+    static const char *dependency_names[6]={
+        "guest-access","guest-read","target-color","target-depth",
+        "texture-raw","texture-palette"
+    };
+    for(unsigned source=0;source<6;source++) {
+        uint64_t count[4]={0};double total_ms=0;
+        for(unsigned shape=0;shape<4;shape++) {
+            count[shape]=g.dependency_source[source][shape].drains;
+            total_ms+=g.dependency_source[source][shape].wait_ms;
+        }
+        uint64_t total=count[0]+count[1]+count[2]+count[3];
+        if(total)fprintf(stderr,
+            "[GPU-DEPENDENCY-SOURCE] source=%s drains=%llu target640=%llu target256=%llu target128=%llu other=%llu wall_ms=%.3f\n",
+            dependency_names[source],(unsigned long long)total,
+            (unsigned long long)count[0],(unsigned long long)count[1],
+            (unsigned long long)count[2],(unsigned long long)count[3],total_ms);
+    }
+    memset(g.dependency_source,0,sizeof g.dependency_source);
     g.pending_fast_empty=g.pending_range_checks=0;
     g.queued_readbacks=g.pending_peak=g.pending_dependencies=g.pending_capacity=0;g.pending_submit_ms=0;
     fprintf(stderr,"[GPU-EMPTY-STATS] enabled=%u skipped_readbacks=%llu initialized_targets=%llu\n",
