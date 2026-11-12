@@ -72,7 +72,7 @@ typedef struct {
     uint32_t *host_baseline;
     unsigned baseline_bytes;int baseline_valid;
     unsigned surface_bytes,stats_bytes;
-    int has_stats,publish_surface,surface_copy_pending;
+    int has_stats,publish_surface,publish_depth,surface_copy_pending;
     NvGpuState target;
     uint8_t *host_color;
     float *host_depth;
@@ -153,6 +153,10 @@ static struct {
     int auto_enabled,auto_done,auto_busy,auto_choose_compute,target_written;
     double auto_native_ms,auto_compute_ms;
     int readback_queue,readback_queue_test;
+    struct {
+        int enabled,written;
+        uint64_t queued,shared_binds;
+    } readonly_depth;
     int skip_empty_stats,stats_required,stats_initialized;
     uint64_t empty_stats_skips,stats_initializations;
     GpuPendingReadback pending[NV_GPU_PENDING_READBACKS];
@@ -646,36 +650,31 @@ static int gpu_pending_dependency(unsigned origin,const GpuPendingReadback *p)
 }
 static int gpu_pending_access(const void *address,size_t bytes,unsigned origin)
 {
-    if(!g.fast_pending_access){
-        for(unsigned i=0;i<g.pending_count;i++) {
-            GpuPendingReadback *p=&g.pending[i];
-            if(gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
-               gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride))) {
-                if(!g.selftest)++g.pending_dependencies;
-                return gpu_pending_dependency(origin,p);
-            }
-        }
-        return 1;
-    }
     if(!g.pending_count){
-        if(!g.selftest)++g.pending_fast_empty;
+        if(g.fast_pending_access && !g.selftest)++g.pending_fast_empty;
         return 1;
     }
     if(!address || !bytes)return 1;
-    if(!g.selftest)++g.pending_range_checks;
-    uintptr_t canonical=gpu_canonical_host(address);
+    if(g.fast_pending_access && !g.selftest)++g.pending_range_checks;
+    uintptr_t canonical=g.fast_pending_access?gpu_canonical_host(address):0;
+    int skipped_depth=0;
     for(unsigned i=0;i<g.pending_count;i++) {
         GpuPendingReadback *p=&g.pending[i];
-        int overlap=p->range_valid?
-            (gpu_canonical_overlap(canonical,bytes,p->color_canonical,p->color_span) ||
-             gpu_canonical_overlap(canonical,bytes,p->depth_canonical,p->depth_span)):
-            (gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target)) ||
-             gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride)));
+        int fast=g.fast_pending_access && p->range_valid;
+        int overlap=fast?gpu_canonical_overlap(canonical,bytes,p->color_canonical,p->color_span):
+            gpu_host_overlap(address,bytes,p->host_color,gpu_target_color_bytes(&p->target));
+        if(!overlap) {
+            int depth_overlap=fast?gpu_canonical_overlap(canonical,bytes,p->depth_canonical,p->depth_span):
+                gpu_host_overlap(address,bytes,p->host_depth,gpu_target_depth_bytes(&p->target,p->depth_stride));
+            if(depth_overlap && origin==GPU_DEP_TARGET_DEPTH && !p->publish_depth)skipped_depth=1;
+            else overlap=depth_overlap;
+        }
         if(overlap) {
             if(!g.selftest)++g.pending_dependencies;
             return gpu_pending_dependency(origin,p);
         }
     }
+    if(skipped_depth && !g.selftest)++g.readonly_depth.shared_binds;
     return 1;
 }
 int nv_gpu_guest_access(uint64_t address,uint64_t bytes)
@@ -782,6 +781,12 @@ static int gpu_queue_readback(void)
     p->depth_canonical=gpu_canonical_host(p->host_depth);
     p->depth_span=p->host_depth?gpu_target_depth_bytes(&p->target,p->depth_stride):0;
     p->range_valid=1;
+    /* If the CPU destinations alias, the existing color-then-depth stores
+     * determine the result even when the GPU only changed color. */
+    p->publish_depth=p->host_depth && (!g.readonly_depth.enabled || g.selftest ||
+        g.readonly_depth.written || gpu_canonical_overlap(p->color_canonical,p->color_span,
+            p->depth_canonical,p->depth_span));
+    if(p->host_depth && !p->publish_depth)++g.readonly_depth.queued;
     p->triangles=g.pending_triangles;++g.pending_count;
     if(!g.selftest){++g.queued_readbacks;g.pending_submit_ms+=gpu_ms()-begin;
         ++g.target_shape[gpu_target_shape(g.target.width,g.target.height)].queued;
@@ -843,14 +848,14 @@ static int gpu_pending_drain(void)
             unsigned at=y*p->target.width+p->left,count=p->right-p->left;int used=0;
             if(p->target.bpp==4 && ((p->target.format>>8)&15)!=2){
                 void *dest=p->host_color+(size_t)y*p->target.pitch+p->left*4u;
-                void *z=p->host_depth?p->host_depth+(size_t)y*p->depth_stride+p->left:NULL;
+                void *z=p->publish_depth?p->host_depth+(size_t)y*p->depth_stride+p->left:NULL;
                 used=nv_gpu_surface_copy(pixels+at,dest,z,count,g.readback_simd);
             }else for(unsigned x=p->left;x<p->right;x++) {
                 const GpuSurface *pixel=pixels+y*p->target.width+x;
                 uint8_t *dest=p->host_color+gpu_color_at(&p->target,x,y);
                 if(p->target.bpp==4)memcpy(dest,&pixel->color,4);
                 else {uint32_t v=pixel->color;uint16_t packed=(uint16_t)(((v>>8)&0xF800)|((v>>5)&0x07E0)|((v>>3)&31));memcpy(dest,&packed,2);}
-                if(p->host_depth)memcpy(p->host_depth+(size_t)y*p->depth_stride+x,&pixel->depth_bits,4);
+                if(p->publish_depth)memcpy(p->host_depth+(size_t)y*p->depth_stride+x,&pixel->depth_bits,4);
             }
             if(!g.selftest){g.readback_time.simd_rows+=used;g.readback_time.scalar_rows+=!used;g.readback_time.pixels+=count;}
         }
@@ -1164,6 +1169,7 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
     if(!g.selftest){g.color_uploads+=color_changed;g.depth_uploads+=depth_changed;g.color_reuses+=!color_changed;g.depth_reuses+=!depth_changed;}
     g.target=*s;g.host_color=color;g.host_depth=depth;g.depth_stride=stride;
     g.active=1;g.resume.active=0;g.completion.unpublished=0;g.target_written=0;g.pending_triangles=0;g.dirty_left=s->width;g.dirty_top=s->height;g.dirty_right=g.dirty_bottom=0;
+    g.readonly_depth.written=0;
     g.seed.snapshot_valid=0;g.seed.depth_dirty=1;
     if(!g.selftest){++g.target_binds;
         ++g.target_shape[gpu_target_shape(s->width,s->height)].binds;
@@ -1575,8 +1581,10 @@ static int gpu_flush(void)
     /* After this ordered batch, the seed remains exact only if no draw could
      * write depth. Alpha/coverage failures may leave depth unchanged; marking
      * a possible writer dirty is conservative and preserves bitwise output. */
-    if(g.native && g.seed.enabled)for(unsigned i=0;i<g.state_count;i++)
-        if(g.queued_state[i].depth_available && g.queued_state[i].depth_mask){g.seed.depth_dirty=1;break;}
+    if(g.native && (g.seed.enabled || (g.readonly_depth.enabled && !g.readonly_depth.written)))
+        for(unsigned i=0;i<g.state_count;i++)if(g.queued_state[i].depth_available && g.queued_state[i].depth_mask){
+            g.seed.depth_dirty=1;g.readonly_depth.written=1;break;
+        }
     g.target_written=1;g.pending_triangles+=g.queued_count;
     if(!g.selftest){
         double end=gpu_ms();++g.flush_time.batches;g.flush_time.upload_ms+=upload_end-begin;
@@ -1614,7 +1622,7 @@ static int gpu_clear(unsigned left,unsigned top,unsigned right,unsigned bottom,u
     ID3D11DeviceContext_CSSetShaderResources(g.context,0,5,srv);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(g.context,0,3,uav,NULL);
     g.target_written=1;
-    if(mask&2u)g.seed.depth_dirty=1;
+    if(mask&2u){g.seed.depth_dirty=1;g.readonly_depth.written=1;}
     if(left<g.dirty_left)g.dirty_left=left;if(right>g.dirty_right)g.dirty_right=right;
     if(top<g.dirty_top)g.dirty_top=top;if(bottom>g.dirty_bottom)g.dirty_bottom=bottom;
     if(gpu_capture_header(8,sizeof parameters))gpu_capture_data(parameters,sizeof parameters);
@@ -2131,6 +2139,8 @@ static int gpu_initialize(void)
     if(!enabled || atoi(enabled)<=0)return 0;
     const char *defer=getenv("RECOMP_GPU_DEFER_READBACK");
     g.deferred_readback.enabled=!defer || atoi(defer)>0;
+    const char *readonly_depth=getenv("RECOMP_GPU_READONLY_DEPTH");
+    g.readonly_depth.enabled=readonly_depth && atoi(readonly_depth)>0;
     const char *fast_pending=getenv("RECOMP_GPU_FAST_PENDING_ACCESS");
     g.fast_pending_access=!fast_pending || atoi(fast_pending)>0;
     const char *partial_readback=getenv("RECOMP_GPU_PARTIAL_READBACK");
@@ -3220,6 +3230,9 @@ void nv_gpu_report(void)
     fprintf(stderr,"[GPU-PENDING-ACCESS] enabled=%u empty=%llu range_checks=%llu\n",
         (unsigned)g.fast_pending_access,(unsigned long long)g.pending_fast_empty,
         (unsigned long long)g.pending_range_checks);
+    if(g.readonly_depth.enabled)fprintf(stderr,"[GPU-READONLY-DEPTH] queued=%llu shared_binds=%llu\n",
+        (unsigned long long)g.readonly_depth.queued,(unsigned long long)g.readonly_depth.shared_binds);
+    g.readonly_depth.queued=g.readonly_depth.shared_binds=0;
     static const char *dependency_names[6]={
         "guest-access","guest-read","target-color","target-depth",
         "texture-raw","texture-palette"

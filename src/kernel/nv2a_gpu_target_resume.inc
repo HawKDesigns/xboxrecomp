@@ -87,6 +87,7 @@ static int gpu_resume_target(const NvGpuState *s,uint8_t *color,float *depth,uns
     memcpy(g.depth_upload,p->host_baseline+pixels,pixels*4u);
     g.target=*s;g.host_color=color;g.host_depth=depth;g.depth_stride=stride;
     g.active=g.resume.active=1;g.resident=0;g.target_written=1;g.pending_triangles=0;
+    g.readonly_depth.written=p->publish_depth;
     g.stats_required=g.stats_initialized=0;
     g.dirty_left=s->width;g.dirty_top=s->height;g.dirty_right=g.dirty_bottom=0;
     if(g.resume.retire_pixels) {
