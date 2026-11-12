@@ -278,6 +278,11 @@ def main():
                              "entered at the target, instead of a plain "
                              "return. Each target is a full copy, so it can "
                              "grow the generated code a lot. Off by default")
+    parser.add_argument("--track-guest-pc", action="store_true",
+                        help="Emit guest block address markers for RECOMP_ENABLE_GUEST_PC builds")
+    parser.add_argument("--runtime-instruction-hooks", action="store_true",
+                        help="Route IN, OUT and WBINVD through title-provided "
+                             "runtime hooks that receive the guest address")
     parser.add_argument("--back-edge-yield", action="store_true",
                         help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
                              "check, at every loop back edge. The guest CPU "
@@ -364,6 +369,8 @@ def main():
             "icall_sites.json"),
         back_edge_yield=args.back_edge_yield,
         entry_stubs=args.entry_stubs,
+        runtime_instruction_hooks=args.runtime_instruction_hooks,
+        track_guest_pc=args.track_guest_pc,
     )
 
     t_load = time.time() - t0

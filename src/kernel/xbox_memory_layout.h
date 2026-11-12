@@ -174,17 +174,14 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
                            uint32_t src_off, uint32_t dst_off);
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
-/* Advance those counters now, because a swap really completed. Called by the
- * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. A counter the
- * title is seen to move itself is no longer bumped by either. */
+/* Associate the registered display clock with a title-built vblank KEVENT. */
+int xbox_Nv2aVblankEvent(uint32_t device_ptr_va,uint32_t event_off);
+/* Refresh elapsed display ticks on FLIP_STALL. Presentation does not add a
+ * vblank or reset the clock phase; display time runs independently of draws. */
 void xbox_Nv2aFrameCounterFlip(void);
 /* A word of the NV2A register file (offset from the register base); NULL until
  * the aperture is mapped. */
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
-/* Registered counters the title turned out to move itself (its vblank DPC),
- * which the toolkit has stopped bumping; for the [GPU] report. */
-uint32_t xbox_Nv2aFrameCountersOwned(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -226,9 +223,20 @@ uint32_t xbox_ContiguousInUseBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
-/* Where the mirrored fence word is (0 if none is registered or it does not
- * resolve into the contiguous window). For the pushbuffer executor. */
-uint32_t xbox_Nv2aFenceWordVa(void);
+
+/* A registered software NOP completion, delivered by the executor at its
+ * position in the command stream, after earlier synchronous raster work. */
+int xbox_Nv2aSoftwareEvent(uint32_t device_ptr_va,uint32_t event_off,uint32_t value);
+int xbox_Nv2aHandleSoftwareMethod(uint32_t subchannel,uint32_t value);
+int xbox_Nv2aResolveSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t *address);
+int xbox_Nv2aReleaseResolvedSoftwareEvent(uint32_t subchannel,uint32_t value,uint32_t address);
+
+int xbox_Nv2aPushBufferRing(uint32_t device_ptr_va,uint32_t begin_off,uint32_t end_off);
+int xbox_Nv2aCommandFence(uint32_t device_ptr_va,uint32_t pointer_off,uint32_t context,uint32_t bytes);
+int xbox_Nv2aReleaseFence(uint32_t context,uint32_t offset,uint32_t value);
+int xbox_Nv2aResolveFence(uint32_t context,uint32_t offset,uint32_t *address);
+int xbox_Nv2aReleaseResolvedFence(uint32_t context,uint32_t offset,uint32_t address,uint32_t value);
+int xbox_Nv2aFifoRead(uint32_t va,uint32_t *word);
 
 void xbox_MemoryLayoutShutdown(void);
 

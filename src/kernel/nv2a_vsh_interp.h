@@ -49,6 +49,23 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* Repeated inputs can be reused only while execution cannot write constants. */
+int nv2a_vsh_cacheable(void);
+/* Exact-matched compiled programs fetch only referenced attributes. Unknown
+ * programs and context-writing execution preserve the full interpreter path. */
+uint32_t nv2a_vsh_input_mask(void);
+void nv2a_vsh_report(void);
+typedef struct {
+    unsigned program_id, count, inputs, position_kind;
+    const uint32_t (*words)[4];
+    const float (*constants)[4];
+} Nv2aVshSnapshot;
+/* Read-only immutable program identity and live constants. The caller copies
+ * constants before returning to the guest. Context-writing/unknown programs
+ * never enter GPU geometry. Known-program enumeration is startup-thread safe. */
+int nv2a_vsh_snapshot(Nv2aVshSnapshot *snapshot);
+unsigned nv2a_vsh_known_count(void);
+const uint32_t (*nv2a_vsh_known_program(unsigned id,unsigned *count))[4];
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
@@ -57,5 +74,6 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
  * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
+void nv2a_vsh_trace_state(void); /* Read-only program/constant snapshot. */
 
 #endif

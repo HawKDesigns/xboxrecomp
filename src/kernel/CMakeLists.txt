@@ -28,12 +28,56 @@ set(KERNEL_SOURCES
     recomp_diff.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
-    nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
+    nv2a_gpu_raster.c
+    nv2a_gpu_tiles.c
 )
 
+# Build the generic embedded shader locally from source. Optional QPR2 literal
+# bodies are generated from a user-owned GPU capture, never committed.
+if(WIN32)
+    set(QPR2_SHADER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(QPR2_SHADER_INPUTS)
+    foreach(name nv2a_gpu_raster.hlsl nv2a_gpu_rov.hlsl nv2a_gpu_report_reset.hlsl
+                 nv2a_gpu_coverage.hlsl nv2a_gpu_clear.hlsl nv2a_gpu_types.h
+                 nv2a_gpu_pixel.inc nv2a_gpu_literal_fallback.inc nv2a_gpu_compact.inc
+                 nv2a_gpu_shade.inc nv2a_gpu_source.inc nv2a_gpu_geometry.hlsl
+                 nv2a_gpu_texcopy.hlsl nv2a_gpu_raw_types.h nv2a_gpu_vsh.inc
+                 nv2a_gpu_prepare.inc)
+        list(APPEND QPR2_SHADER_INPUTS "${QPR2_SHADER_ROOT}/${name}")
+    endforeach()
+    # ZIP extraction and generated local shaders can preserve older timestamps
+    # than an already embedded header. Always compare source content before
+    # compiling; the embedding script writes only when bytes actually change.
+    add_custom_target(xbox_kernel_shader_sources
+        COMMAND "${CMAKE_COMMAND}" "-DINPUT_ROOT=${QPR2_SHADER_ROOT}"
+                -P "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
+        BYPRODUCTS "${QPR2_SHADER_ROOT}/nv2a_gpu_shader.h"
+        DEPENDS ${QPR2_SHADER_INPUTS} "${QPR2_SHADER_ROOT}/embed_qpr2_gpu_shader.cmake"
+        VERBATIM)
+
+    # A header first created after a generic build was not an include in the
+    # old object file. Toggle per-source compile definitions on reconfigure so
+    # MSBuild must rebuild the raster and vertex objects when it appears.
+    set(QPR2_LITERAL_HEADER_PRESENT 0)
+    if(EXISTS "${QPR2_SHADER_ROOT}/nv2a_gpu_literal_programs.h")
+        set(QPR2_LITERAL_HEADER_PRESENT 1)
+    endif()
+    set_source_files_properties(nv2a_gpu_raster.c PROPERTIES
+        COMPILE_DEFINITIONS "NV2A_QPR2_LITERAL_HEADER_PRESENT=${QPR2_LITERAL_HEADER_PRESENT}")
+    set(QPR2_NATIVE_VSH_HEADER_PRESENT 0)
+    if(EXISTS "${QPR2_SHADER_ROOT}/nv2a_vsh_compiled.h")
+        set(QPR2_NATIVE_VSH_HEADER_PRESENT 1)
+    endif()
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES
+        COMPILE_DEFINITIONS "NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT=${QPR2_NATIVE_VSH_HEADER_PRESENT}")
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
+if(WIN32)
+    add_dependencies(xbox_kernel xbox_kernel_shader_sources)
+endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
 # CMAKE_SOURCE_DIR, which is the consuming project's root under add_subdirectory().
@@ -47,7 +91,8 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
-    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt d3d11 dxgi dxguid d3dcompiler)
+    target_compile_definitions(xbox_kernel PRIVATE NV2A_ENABLE_GPU_RASTER=1)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
@@ -55,9 +100,12 @@ else()
 endif()
 
 if(MSVC)
+    # Shader specializations retain the interpreter's operation ordering.
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES COMPILE_OPTIONS "/fp:precise")
     target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
+    set_source_files_properties(nv2a_vsh_interp.c PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 

@@ -64,10 +64,8 @@ int main(void)
         return 1;
     }
 
-    /* The colour outputs are clamped to 0..1, as the NV2A does before it
-     * interpolates them: mov oD0, c[0] / mov oD1, -c[0] with c[0] out of
-     * range. Lighting programs push oD0 well above 1, and unclamped every
-     * lit model came out washed out. */
+    /* Preserve the v126 vertex colors at this boundary so both CPU fallback
+     * and QPR2's raw GPU path send the same inputs to interpolation. */
     {
         uint32_t d0[4] = {0}, d1[4] = {0};
         const float c0[4] = {2.0f, -1.0f, 0.5f, 1.0f};
@@ -85,9 +83,9 @@ int main(void)
             puts("FAIL: colour program did not run");
             return 1;
         }
-        if (o.d0[0] != 1.0f || o.d0[1] != 0.0f || o.d0[2] != 0.5f || o.d0[3] != 1.0f
-            || o.d1[0] != 0.0f || o.d1[1] != 1.0f || o.d1[2] != 0.0f || o.d1[3] != 0.0f) {
-            printf("FAIL: oD0 %g %g %g %g (want 1 0 0.5 1), oD1 %g %g %g %g (want 0 1 0 0)\n",
+        if (o.d0[0] != 2.0f || o.d0[1] != -1.0f || o.d0[2] != 0.5f || o.d0[3] != 1.0f
+            || o.d1[0] != -2.0f || o.d1[1] != 1.0f || o.d1[2] != -0.5f || o.d1[3] != -1.0f) {
+            printf("FAIL: oD0 %g %g %g %g (want 2 -1 0.5 1), oD1 %g %g %g %g (want -2 1 -0.5 -1)\n",
                    o.d0[0], o.d0[1], o.d0[2], o.d0[3], o.d1[0], o.d1[1], o.d1[2], o.d1[3]);
             return 1;
         }

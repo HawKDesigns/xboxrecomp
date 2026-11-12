@@ -556,12 +556,36 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+static void usb_gamepad_trace(int pad, const uint8_t *report,
+                              const XBOX_INPUT_STATE *state, DWORD rc)
+{
+    static int on = -1;
+    static uint8_t previous[USB_GAMEPAD_MAX][10];
+    static DWORD last[USB_GAMEPAD_MAX];
+    static unsigned seen[USB_GAMEPAD_MAX];
+    DWORD now;
+    if (on < 0) on = getenv("RECOMP_INPUT_DIAG") != NULL;
+    if (!on || pad < 0 || pad >= USB_GAMEPAD_MAX) return;
+    now = GetTickCount();
+    if (!seen[pad] || memcmp(previous[pad], report + 2, 10) != 0
+                  || (DWORD)(now - last[pad]) >= 5000u) {
+        extern int xbox_FramebufferKeyDown(int vk);
+        fprintf(stderr, "[INPUT-REPORT] port=%d host_rc=%lu packet=%lu digital=%02X%02X A=%u B=%u X=%u Y=%u LT=%u RT=%u keyboard=%d enter=%d\n",
+                pad, (unsigned long)rc, state ? (unsigned long)state->dwPacketNumber : 0ul,
+                report[3], report[2], report[4], report[5], report[6], report[7], report[10], report[11],
+                getenv("RECOMP_KEYBOARD") != NULL, xbox_FramebufferKeyDown(0x0D));
+        memcpy(previous[pad], report + 2, 10);
+        last[pad] = now; seen[pad] = 1;
+    }
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
     uint8_t synth = synthetic_buttons();
     int i;
+    DWORD host_rc;
 
     if (max < 20)
         return 0;
@@ -571,46 +595,14 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
-    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second.
-     *
-     * "Nothing happens when I press a key" has several candidate causes and
-     * guessing between them costs a rebuild each: the variable not read,
-     * XInput claiming a pad so the keyboard fallback never runs, the window
-     * not receiving the key, or the report going out without it. Printing
-     * all four together answers it in one run.
-     *
-     * It samples the held state, so pair it with the window's own
-     * RECOMP_KEY_TRACE: that answers "did the key arrive", this answers
-     * "is the chain wired". */
-    {
-        static int diag = -1;
-        if (diag < 0)
-            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
-        if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
-            static unsigned long last;
-            unsigned long now = (unsigned long)GetTickCount();
-            if (now - last > 1000) {
-                XBOX_INPUT_STATE probe;
-                DWORD rc = xbox_InputGetState(0, &probe);
-                last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
-                        xbox_FramebufferKeyDown(0x0D),
-                        (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
-                fflush(stderr);
-            }
-        }
-    }
-
     /* The synthetic press and the host pad drive pad n from host pad n. */
     if (pad != 0)
         synth = 0;
-    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
+    host_rc = xbox_InputGetState((DWORD)pad, &state);
+    if (host_rc != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        usb_gamepad_trace(pad, out, NULL, host_rc);
         return 20;
     }
 
@@ -628,5 +620,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    usb_gamepad_trace(pad, out, &state, host_rc);
     return 20;
 }

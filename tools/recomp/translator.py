@@ -529,7 +529,8 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, force_returns=None, icall_sites=None):
+                 trace_functions=None, force_returns=None, icall_sites=None,
+                 runtime_instruction_hooks=False, track_guest_pc=False):
         """
         xbe_data: bytes - raw XBE file contents
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
@@ -541,6 +542,7 @@ class FunctionTranslator:
         seh_prolog/seh_epilog: override the detected SEH helper addresses
         """
         self.xbe_data = xbe_data
+        self.track_guest_pc = track_guest_pc
         self.func_db = func_db
         self.icall_sites = dict(icall_sites or {})
         self.label_db = label_db or {}
@@ -552,7 +554,8 @@ class FunctionTranslator:
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-                             seh_epilog=seh_epilog)
+                             seh_epilog=seh_epilog,
+                             runtime_instruction_hooks=runtime_instruction_hooks)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
@@ -3360,6 +3363,14 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
+            # Publish the guest basic block independently of the native host
+            # instruction pointer.  A watchdog sampling lifted C otherwise
+            # sees only registers and the last call, which cannot identify a
+            # call-free busy loop.  One volatile store per entered block is a
+            # deliberate diagnostic cost and gives an exact XBE address.
+            if self.track_guest_pc:
+                lines.append(f"    RECOMP_PC(0x{bb.start:08X}u);")
+
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
             # states come from the pre-pass above, so a back edge's
@@ -3549,7 +3560,8 @@ class BatchTranslator:
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
                  icall_sites_json_path=None, back_edge_yield=False,
-                 entry_stubs=False):
+                 entry_stubs=False, runtime_instruction_hooks=False,
+                 track_guest_pc=False):
         """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
         (--back-edge-yield; off by default). entry_stubs: an unresolved
         target inside a function enters a copy of it (--entry-stubs)."""
@@ -3614,7 +3626,9 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites)
+            force_returns=force_returns, icall_sites=self.icall_sites,
+            runtime_instruction_hooks=runtime_instruction_hooks,
+            track_guest_pc=track_guest_pc)
         self.translator.back_edge_yield = self.back_edge_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
@@ -3890,6 +3904,12 @@ class BatchTranslator:
         # linking; hitting one at runtime is a silent no-op, so they are
         # reported and written to their own file rather than hidden among the
         # translated chunks.
+        # The title can supply a callback at an address the disassembler
+        # missed. Give it a real declaration and dispatch entry just as for
+        # an override of a discovered function.
+        for addr in sorted(manual - manual_decls.keys()):
+            info = self.func_db.get(addr, {})
+            manual_decls[addr] = _func_ident(addr, info.get("name", f"sub_{addr:08X}"))
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
         unresolved = {

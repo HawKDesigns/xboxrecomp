@@ -24,6 +24,7 @@
 #include "apu_xaudio2.h"
 #include "apu_wav.h"
 #include "fpconv.h"
+#include "apu_output_limit.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
@@ -36,7 +37,7 @@ MCPXAPUState *g_state = NULL;
 
 /* Forward declarations for software mixer */
 static void mixer_init(void);
-static void mixer_render(int16_t frame_buf[][2], int num_samples);
+static void mixer_render(float frame_buf[][2], int num_samples);
 static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
 static CRITICAL_SECTION g_mixer_cs;
@@ -89,9 +90,13 @@ static inline uint32_t apu_mapped_ram(void)
     return (uint32_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram);
 }
 
+#include "../kernel/xbox_bus_address.h"
+
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (xbox_bus_is_ram(a))
+        return g_apu_ram_ptr + xbox_bus_ram_address(a);
     /* RAM above the window's 64 MB. On a 128 MB layout (a devkit) most of
      * the heap sits above 0x04000000, and so do the sound buffers a title
      * malloc()s and hands to DirectSound as plain pointers, which
@@ -498,6 +503,7 @@ typedef struct {
     WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
     int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
     int      next_buf;
+    int      fill_samples;
     bool     initialized;
     int      frames_written;
 } WaveOutState;
@@ -564,6 +570,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     }
 
     g_waveout.next_buf = 0;
+    g_waveout.fill_samples = 0;
     g_waveout.initialized = true;
     g_waveout.frames_written = 0;
 
@@ -819,30 +826,16 @@ static void hs_submit(int n, int ok, int q)
     }
 }
 
-/* Saturating add of a 16-bit stereo block into another. */
-static void mix_into(int16_t dst[][2], const int16_t src[][2], int n)
-{
-    for (int i = 0; i < n; i++) {
-        for (int c = 0; c < 2; c++) {
-            int32_t v = (int32_t)dst[i][c] + src[i][c];
-            if (v > 32767)  v = 32767;
-            if (v < -32768) v = -32768;
-            dst[i][c] = (int16_t)v;
-        }
-    }
-}
-
 /* Hand one EP period (MIXER_FRAME_SAMPLES samples) to the waveOut arm. The
  * device buffers are larger than a period, so periods accumulate in the
  * current buffer and it is written when full: every sample rendered is
  * written once, none is rendered twice. */
 static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
 {
-    static int fill;                     /* samples already in next_buf */
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
 
-    if (fill == 0) {
+    if (g_waveout.fill_samples == 0) {
         /* Wait if this buffer is still playing (with timeout) */
         int wait_loops = 0;
         while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
@@ -853,61 +846,47 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
         }
     }
 
-    memcpy(g_waveout.bufs[idx][fill], period,
+    memcpy(g_waveout.bufs[idx][g_waveout.fill_samples], period,
            MIXER_FRAME_SAMPLES * 2 * sizeof(int16_t));
-    fill += MIXER_FRAME_SAMPLES;
-    if (fill < WAVEOUT_BUF_SAMPLES)
+    g_waveout.fill_samples += MIXER_FRAME_SAMPLES;
+    if (g_waveout.fill_samples < WAVEOUT_BUF_SAMPLES)
         return;
 
     hdr->dwFlags &= ~WHDR_DONE;
     waveOutWrite(g_waveout.hwo, hdr, sizeof(WAVEHDR));
     g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
     g_waveout.frames_written++;
-    fill = 0;
+    g_waveout.fill_samples = 0;
 }
 
-/* Called once per 32-sample frame; acts on the last frame of each EP period
- * (8 frames, 256 samples, 5.33 ms).
- *
- * frame_buf holds the period the DSP stage just wrote (mcpx_apu_dsp_frame,
- * or the VP monitor point, which accumulates). The test tone and the
- * software mixer are rendered into a scratch period and added to it, and
- * exactly that one period is handed to the device -- once.
- *
- * This used to clear frame_buf before rendering the tone and the mixer into
- * it, so whatever the VP and DSP produced never reached the device, and it
- * rendered a whole device buffer (1024 samples) per 256-sample period. */
+/* The DSP/VP and software mixer share a wide PCM buffer. Finish one
+ * stereo period here, then let the v0.17 device backend batch submissions. */
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
-    int16_t period[MIXER_FRAME_SAMPLES][2];
-    int16_t extra[MIXER_FRAME_SAMPLES][2];
+    int16_t (*period)[2] = d->monitor.frame_buf;
+    float (*mix)[2] = d->monitor.mix_buf;
 
-    if ((d->ep_frame_div + 1) % 8) {
+    if ((d->ep_frame_div + 1) % 8)
         return;
-    }
-
-    memcpy(period, d->monitor.frame_buf, sizeof(period));
-    /* The VP monitor point accumulates into frame_buf, so the next period
-     * has to start from silence. */
-    memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
 
     if (g_audio_muted) {
-        memset(period, 0, sizeof(period));
+        memset(mix, 0, sizeof(d->monitor.mix_buf));
     } else {
-        memset(extra, 0, sizeof(extra));
         if (g_test_tone.active) {
             for (int i = 0; i < MIXER_FRAME_SAMPLES; i++) {
-                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                extra[i][0] = s;
-                extra[i][1] = s;
+                float sample = (float)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                mix[i][0] += sample;
+                mix[i][1] += sample;
                 g_test_tone.phase += g_test_tone.phase_inc;
                 if (g_test_tone.phase >= 2.0 * M_PI)
                     g_test_tone.phase -= 2.0 * M_PI;
             }
         }
-        mixer_render(extra, MIXER_FRAME_SAMPLES);
-        mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
+        mixer_render(mix, MIXER_FRAME_SAMPLES);
     }
+    apu_output_limit(&d->monitor.limiter, mix, period, MIXER_FRAME_SAMPLES,
+                     d->monitor.limit_enabled);
+    memset(mix, 0, sizeof(d->monitor.mix_buf));
 
     /* A period dropped while pacing is stalled never reaches the device,
      * so it stays out of the dump too. */
@@ -921,10 +900,10 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                       xa2_submit_samples((const int16_t *)period,
                                          MIXER_FRAME_SAMPLES), q);
         }
-        return;
-    }
-    if (g_waveout.initialized)
+    } else if (g_waveout.initialized) {
         waveout_submit(d, (const int16_t (*)[2])period);
+    }
+    memset(period, 0, sizeof(d->monitor.frame_buf));
 }
 
 /* ============================================================
@@ -1169,6 +1148,11 @@ static void apu_irq_stats_line(void)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    int timing = getenv("RECOMP_AUDIO_DIAG") != NULL;
+    int64_t work_us=0, irq_us=0, peak_us=0, report_us=0;
+    uint64_t subframes=0;
+    /* Keep the 5.33ms audio producer responsive during rendering/asset work. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -1194,6 +1178,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * whenever FECTL was trapped or halted, and DirectSound then waits
          * forever to post its next command: Burnout 3 stalls in
          * sub_002F805E polling the same doorbell it was acked on at init. */
+        int64_t work_begin = timing ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
         mcpx_apu_dsp_ack_poll(d);
 
         int kind = mcpx_apu_frame_kind(d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
@@ -1263,8 +1248,21 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
+        int64_t irq_begin = timing ? qemu_clock_get_us(QEMU_CLOCK_REALTIME) : 0;
         apu_deliver_irq(d);
-        apu_irq_stats_line();
+        if(timing) {
+            int64_t end=qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            int64_t work=irq_begin-work_begin;
+            work_us+=work;irq_us+=end-irq_begin;++subframes;
+            if(work>peak_us)peak_us=work;
+            if(!report_us)report_us=end;
+            if(end-report_us>=5000000) {
+                fprintf(stderr,"[AUDIO-WORK] subframes=%llu span_ms=%.3f pipeline_ms=%.3f irq_ms=%.3f peak_subframe_ms=%.3f\n",
+                        (unsigned long long)subframes,(end-report_us)/1000.0,
+                        work_us/1000.0,irq_us/1000.0,peak_us/1000.0);
+                report_us=end;work_us=irq_us=peak_us=0;subframes=0;
+            }
+        }
 
         /* Let the guest in once per frame.
          *
@@ -1353,8 +1351,27 @@ static void apu_diag_reset(void)
     s_irq_next_ns = 0;
 }
 
+bool mcpx_apu_validate_state_layout(void)
+{
+    MCPXAPUStateLayout core = mcpx_apu_local_state_layout();
+    MCPXAPUStateLayout vp = mcpx_apu_vp_state_layout();
+    MCPXAPUStateLayout dsp = mcpx_apu_dsp_state_layout();
+    bool valid = memcmp(&core, &vp, sizeof(core)) == 0 &&
+                 memcmp(&core, &dsp, sizeof(core)) == 0;
+    fprintf(stderr, "[APU-LAYOUT] core=%zu/%zu/%zu vp=%zu/%zu/%zu "
+            "dsp=%zu/%zu/%zu compatible=%d\n",
+            core.size, core.regs, core.monitor, vp.size, vp.regs, vp.monitor,
+            dsp.size, dsp.regs, dsp.monitor, valid);
+    if (!valid)
+        fprintf(stderr, "[APU] Incompatible cached audio objects; rebuild xbox_apu.\n");
+    return valid;
+}
+
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+    /* Check before allocation: a stale core can allocate a smaller state than
+     * newer VP/DSP code uses, and all subsequent register accesses disagree. */
+    if (!mcpx_apu_validate_state_layout()) return NULL;
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -1368,6 +1385,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      * against this one's empty ISTS. */
     InterlockedExchange(&s_irq_line, 0);
     apu_diag_reset();
+    const char *limit = getenv("RECOMP_AUDIO_LIMITER");
+    d->monitor.limit_enabled = !limit || atoi(limit) != 0;
+    d->monitor.limiter.gain = 1.0f;
 
     /* RECOMP_APU_SOLO=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */
@@ -1676,7 +1696,7 @@ void apu_mixer_stop(int slot)
 
 /* Mix all active voices into frame_buf. Called from mcpx_apu_monitor_frame.
  * Keep 16 fractional bits in a wide offset so buffers can exceed 65536 frames. */
-static void mixer_render(int16_t frame_buf[][2], int num_samples)
+static void mixer_render(float frame_buf[][2], int num_samples)
 {
     if (!g_mixer_initialized) return;
     EnterCriticalSection(&g_mixer_cs);
@@ -1711,23 +1731,18 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
                 }
             }
 
-            int32_t left, right;
+            float left, right;
             if (voice->num_channels >= 2) {
-                left  = (int32_t)(voice->pcm_data[src_frame * 2] * vol);
-                right = (int32_t)(voice->pcm_data[src_frame * 2 + 1] * vol);
+                left  = voice->pcm_data[src_frame * 2] * vol;
+                right = voice->pcm_data[src_frame * 2 + 1] * vol;
             } else {
-                left = right = (int32_t)(voice->pcm_data[src_frame] * vol);
+                left = right = voice->pcm_data[src_frame] * vol;
             }
 
-            /* Accumulate (mix) into frame_buf with clamping */
-            int32_t mixed_l = frame_buf[i][0] + left;
-            int32_t mixed_r = frame_buf[i][1] + right;
-            if (mixed_l > 32767) mixed_l = 32767;
-            if (mixed_l < -32768) mixed_l = -32768;
-            if (mixed_r > 32767) mixed_r = 32767;
-            if (mixed_r < -32768) mixed_r = -32768;
-            frame_buf[i][0] = (int16_t)mixed_l;
-            frame_buf[i][1] = (int16_t)mixed_r;
+            /* Sum before quantization/limiting; opposite-polarity voices
+             * must be allowed to cancel irrespective of their slot order. */
+            frame_buf[i][0] += left;
+            frame_buf[i][1] += right;
 
             pos += inc;
         }

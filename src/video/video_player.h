@@ -60,6 +60,10 @@ int  video_dump_frame_bmp(const char *path);
  * the title renders into guest RAM appears there; nothing else scans it out. */
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+#ifdef _WIN32
+void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
+                                        uint32_t width, uint32_t height);
+#endif
 /* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
 void xbox_FramebufferWindowSetAA(uint32_t sy);
 int  xbox_FramebufferDumpBmp(const char *path);

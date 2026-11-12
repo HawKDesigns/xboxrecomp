@@ -47,6 +47,9 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
+/* A user close is terminal for this diagnostic host. Clear/start paths run
+ * throughout guest shutdown and must never recreate a dismissed window. */
+static volatile LONG s_fb_closed;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -127,6 +130,26 @@ static void fb_overlay(void)
     if (!presented && s_pvideo_source)
         pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
                        s_fb_width, s_fb_height, s_pvideo_bank);
+}
+
+/* Publish a resolved frame using the same lock as guest-memory flips. */
+void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
+                                        uint32_t width, uint32_t height)
+{
+    if (!s_fb_running || !pixels || width != s_fb_width ||
+        height != s_fb_height || getenv("RECOMP_FB_VA"))
+        return;
+
+    AcquireSRWLockExclusive(&s_present_lock);
+    LONG next = (s_present_idx == 0) ? 1 : 0;
+    size_t bytes = (size_t)width * height * sizeof(*pixels);
+    if (!s_present[next])
+        s_present[next] = (uint32_t *)malloc(bytes);
+    if (s_present[next]) {
+        memcpy(s_present[next], pixels, bytes);
+        s_present_idx = next;
+    }
+    ReleaseSRWLockExclusive(&s_present_lock);
 }
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
@@ -269,6 +292,7 @@ static void fb_toggle_fullscreen(HWND h)
     }
 }
 
+extern void nv_gpu_capture_request(void);
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     /* First press only (bit 30: the key was already down), and with Alt held
@@ -282,6 +306,9 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;                       /* auto-repeat of Alt+Enter */
     switch (m) {
     case WM_CLOSE:
+        InterlockedExchange(&s_fb_closed, 1);
+        DestroyWindow(h);
+        return 0;
     case WM_DESTROY:
         /* Closing the window ends the run. Only stopping this thread left
          * every other one running -- audio played on, and the process had
@@ -302,6 +329,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_KEYDOWN:
+        if(w==0x77 && !(l & ((LPARAM)1<<30))) {nv_gpu_capture_request();return 0;} /* F8 */
     case WM_SYSKEYDOWN:
         xbox_InputKeySet((int)w, 1);
         /* A Shift, Ctrl or Alt is also its side's key, for bindings to
@@ -646,6 +674,8 @@ void xbox_FramebufferWindowStart(void)
     HANDLE th;
 
     if (!getenv("RECOMP_FB_WINDOW"))
+        return;
+    if (InterlockedCompareExchange(&s_fb_closed, 0, 0))
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

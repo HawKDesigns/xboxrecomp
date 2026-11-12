@@ -81,6 +81,19 @@ class DirectionFlagLifterTest(unittest.TestCase):
         self.assertIn("MEM32(edi + _i*4u) = MEM32(esi + _i*4u)", generated)
         self.assertIn("(uint64_t)edi + _n <= esi || (uint64_t)esi + _n <= edi", generated)
 
+    def test_rep_stosd_bulk_fills_normal_ram_but_not_mmio(self):
+        generated = _lift(Instruction(0, 2, "rep stosd", "", "f3ab"))
+
+        self.assertIn("memset(_d, (uint8_t)eax, (size_t)_n)", generated)
+        self.assertIn("edi < 0xFD000000u", generated)
+        self.assertIn("MEM32(edi + _i*_st) = eax", generated)
+
+    def test_rep_stosw_bulk_fills_normal_ram_but_keeps_fallback(self):
+        generated = _lift(Instruction(0, 3, "rep stosw", "", "66f3ab"))
+
+        self.assertIn("memset(_d, (uint8_t)_v, (size_t)_n)", generated)
+        self.assertIn("MEM16(edi + _i*_st) = LO16(eax)", generated)
+
     def test_unprefixed_string_ops_step_by_the_direction_flag(self):
         for mnemonic, size in (("movsb", 1), ("stosw", 2), ("lodsd", 4)):
             with self.subTest(mnemonic=mnemonic):

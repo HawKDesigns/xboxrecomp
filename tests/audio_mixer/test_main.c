@@ -30,7 +30,7 @@ static void check_state(IDirectSoundBuffer8 *buf, DWORD cursor, DWORD status)
 
 static void check_sample(int16_t expected)
 {
-    int16_t out[1][2] = {{0}};
+    float out[1][2] = {{0}};
     mixer_render(out, 1);
     assert(out[0][0] == expected && out[0][1] == expected);
 }
@@ -74,7 +74,7 @@ static void check_playback(WORD channels)
 
     /* Updating Play flags takes effect without restarting. */
     assert(buf->lpVtbl->Play(buf, 0, 0, 0) == S_OK);
-    int16_t out[5][2] = {{0}};
+    float out[5][2] = {{0}};
     mixer_render(out, 5);
     assert(out[0][0] == 200 && out[1][0] == 300 && out[2][0] == 400);
     assert(out[3][0] == 0 && out[4][0] == 0);
@@ -85,8 +85,25 @@ static void check_playback(WORD channels)
     buf->lpVtbl->Release(buf);
 }
 
+/* Overload from early slots must cancel before final clipping. */
+static void check_cancellation(void)
+{
+    int16_t a=30000,b=30000,c=-30000;
+    int slots[3];int16_t *pcm[3]={&a,&b,&c};
+    for(int i=0;i<3;i++) {
+        slots[i]=apu_mixer_alloc_voice();assert(slots[i]>=0);
+        APUMixerVoice *v=apu_mixer_get_voice(slots[i]);
+        v->pcm_data=pcm[i];v->pcm_bytes=2;v->num_channels=1;v->sample_rate=48000;
+        apu_mixer_play(slots[i],0);
+    }
+    float out[1][2]={{0}};mixer_render(out,1);
+    assert(out[0][0]==30000 && out[0][1]==30000);
+    for(int i=0;i<3;i++)apu_mixer_free_voice(slots[i]);
+}
+
 int main(void)
 {
+    check_cancellation();
     check_playback(1);
     check_playback(2);
 

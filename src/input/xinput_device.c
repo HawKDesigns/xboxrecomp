@@ -13,6 +13,7 @@
 #include "xinput_xbox.h"
 #include "keyboard.h"
 #include "mkb_input.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -59,6 +60,20 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+/* Keep Xbox port 0 present even when the host has no controller.  This only
+ * supplies a neutral state; it never manufactures a button press.  A real
+ * XInput device is still queried first and completely replaces the neutral
+ * state when available. */
+static BOOL virtual_pad_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_VIRTUAL_PAD");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
 /* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
  * with the SDL backend; the GDI window in fb_present.c records the keys. */
 
@@ -67,7 +82,8 @@ void xbox_InputInit(void)
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
         XINPUT_STATE state;
         DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
+        g_controller_connected[i] = (result == ERROR_SUCCESS)
+            || (i == 0 && virtual_pad_enabled());
     }
 }
 
@@ -75,6 +91,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
     DWORD result;
+    static BOOL logged_host;
+    static BOOL logged_virtual;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -88,16 +106,35 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             int kb;
             memset(pState, 0, sizeof *pState);
             kb = xbox_InputKeyboardPoll(pState);
-            if (mkb_merge(dwPort, pState))
-                g_controller_connected[dwPort] = TRUE;
-            if (kb || mkb_enabled())
+            int mkb = mkb_merge(dwPort, pState);
+            if (kb || mkb || mkb_enabled()) {
+                g_controller_connected[0] = TRUE;
                 return ERROR_SUCCESS;
+            }
         }
+        if (dwPort == 0 && virtual_pad_enabled()) {
+            memset(pState, 0, sizeof(*pState));
+            pState->dwPacketNumber = g_last_packet[dwPort];
+            g_controller_connected[dwPort] = TRUE;
+            if (!logged_virtual) {
+                logged_virtual = TRUE;
+                fprintf(stderr, "  [INPUT] host XInput unavailable; "
+                                "neutral virtual pad active on port 0\n");
+                fflush(stderr);
+            }
+            return ERROR_SUCCESS;
+        }
+        g_controller_connected[dwPort] = FALSE;
         return result;
     }
 
     g_controller_connected[dwPort] = TRUE;
     g_last_packet[dwPort] = xi_state.dwPacketNumber;
+    if (dwPort == 0 && !logged_host) {
+        logged_host = TRUE;
+        fprintf(stderr, "  [INPUT] host XInput controller active on port 0\n");
+        fflush(stderr);
+    }
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = xi_state.dwPacketNumber;
@@ -137,18 +174,23 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    DWORD result;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    result = XInputSetState(dwPort, &xi_vib);
+    if (result != ERROR_SUCCESS && dwPort == 0 && virtual_pad_enabled())
+        return ERROR_SUCCESS;          /* neutral virtual device has no motors */
+    return result;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    if (dwPort == 0 && virtual_pad_enabled()) return TRUE;
     return g_controller_connected[dwPort];
 }
 
@@ -161,7 +203,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-    if (result != ERROR_SUCCESS) return result;
+    if (result != ERROR_SUCCESS) {
+        if (dwPort != 0 || !virtual_pad_enabled())
+            return result;
+        memset(pCaps, 0, sizeof(*pCaps));
+        pCaps->Type = XINPUT_DEVTYPE_GAMEPAD;
+        pCaps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+        return ERROR_SUCCESS;
+    }
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = xi_caps.Type;

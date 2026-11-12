@@ -196,6 +196,23 @@ static void dump_program(uint32_t start)
     fflush(stderr);
 }
 
+void nv2a_vsh_trace_state(void)
+{
+    uint32_t i;
+    fprintf(stderr, "[VSTATE] start=%u context_write=%u\n", s_start_slot, s_cxt_write);
+    dump_program(s_start_slot);
+    for (i = s_start_slot; i < NV2A_VSH_SLOTS; ++i) {
+        fprintf(stderr, "[VSTATE] instruction[%u]=%08X %08X %08X %08X\n", i,
+            s_program[i][0], s_program[i][1], s_program[i][2], s_program[i][3]);
+        if (field(s_program[i], 3, 0, 1)) break;
+    }
+    for (i = 0; i < NV2A_VSH_CONSTANTS; ++i)
+        fprintf(stderr, "[VSTATE] c[%u]=%.9g %.9g %.9g %.9g\n", i,
+            s_const[i][0], s_const[i][1], s_const[i][2], s_const[i][3]);
+}
+
+int nv2a_vsh_cacheable(void) { return s_cxt_write==0; }
+
 const float *nv2a_vsh_constant(uint32_t index)
 {
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
@@ -346,15 +363,8 @@ static void vsh_finish(Nv2aVshOutput *out, const vec4 *opos,
                        float outregs[13][4])
 {
     memcpy(out->pos, opos->v, sizeof out->pos);
-    /* The NV2A clamps the colour outputs to 0..1 before they are
-     * interpolated, as the fixed-function path already does here.
-     * Lighting programs push them well above 1 (SSX 3's riders), and
-     * unclamped every lit model came out washed out. */
-    for (int k = 0; k < 4; k++) {
-        float c0 = outregs[3][k], c1 = outregs[4][k];
-        out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
-        out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
-    }
+    memcpy(out->d0, outregs[3], sizeof out->d0);
+    memcpy(out->d1, outregs[4], sizeof out->d1);
     memcpy(out->fog, outregs[5], sizeof out->fog);
     memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
     memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
@@ -587,7 +597,7 @@ static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *ou
 
 static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
-int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+static int nv2a_vsh_run_interpreted(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int mode = -1;            /* 0 fields, 1 decoded, 2 both, compared */
 
@@ -706,4 +716,100 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
         }
     }
     return 0;
+}
+
+/* Generated scalar SSA removes opcode decoding, temporary-register arrays,
+ * unused components and per-instruction dispatch. This is CPU execution;
+ * the existing exact clipper and pixel renderer retain their current inputs. */
+#if defined(NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT)
+# if NV2A_QPR2_NATIVE_VSH_HEADER_PRESENT
+#  include "nv2a_vsh_compiled.h"
+#  define NV_VSH_COMPILED_COUNT (sizeof nv_vsh_compiled / sizeof nv_vsh_compiled[0])
+# else
+#  include "nv2a_vsh_compiled_fallback.h"
+#  define NV_VSH_COMPILED_COUNT 0u
+# endif
+#elif defined(__has_include) && __has_include("nv2a_vsh_compiled.h")
+#include "nv2a_vsh_compiled.h"
+#define NV_VSH_COMPILED_COUNT (sizeof nv_vsh_compiled / sizeof nv_vsh_compiled[0])
+#else
+#include "nv2a_vsh_compiled_fallback.h"
+#define NV_VSH_COMPILED_COUNT 0u
+#endif
+
+static const NvVshCompiled *s_native;
+static uint32_t s_native_revision;
+static int s_native_resolved;
+static int s_native_enabled = -1;
+static uint64_t s_native_runs, s_interpreted_runs, s_native_matches, s_native_misses;
+
+static const NvVshCompiled *nv2a_vsh_resolve_native(void)
+{
+    if (s_native_enabled < 0) {
+        const char *e = getenv("RECOMP_VERTEX_NATIVE");
+        s_native_enabled = (!e || atoi(e) > 0) && !getenv("RECOMP_VSH_DUMP");
+    }
+    if (!s_native_enabled || s_cxt_write) return NULL;
+    if (!s_native_resolved || s_native_revision != s_program_revision) {
+        unsigned end = s_start_slot;
+        s_native_resolved = 1;
+        s_native_revision = s_program_revision;
+        s_native = NULL;
+        for (; end < NV2A_VSH_SLOTS; ++end) {
+            if (s_program[end][3] & 1u) {
+                unsigned n = end - s_start_slot + 1;
+                for (unsigned i = 0; i < NV_VSH_COMPILED_COUNT; ++i) {
+                    const NvVshCompiled *p = &nv_vsh_compiled[i];
+                    if (p->count == n && !memcmp(p->words, &s_program[s_start_slot], n * sizeof s_program[0])) {
+                        s_native = p;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        if (s_native) ++s_native_matches; else ++s_native_misses;
+    }
+    return s_native;
+}
+
+uint32_t nv2a_vsh_input_mask(void)
+{
+    const NvVshCompiled *p = nv2a_vsh_resolve_native();
+    return p ? p->inputs : 0xffffu;
+}
+int nv2a_vsh_snapshot(Nv2aVshSnapshot *s)
+{
+    const NvVshCompiled *p=nv2a_vsh_resolve_native();
+    if(!p || !p->position_kind)return 0;
+    s->program_id=(unsigned)(p-nv_vsh_compiled);s->count=p->count;
+    s->inputs=p->inputs;s->position_kind=p->position_kind;s->words=p->words;s->constants=s_const;
+    return 1;
+}
+unsigned nv2a_vsh_known_count(void){return (unsigned)NV_VSH_COMPILED_COUNT;}
+const uint32_t (*nv2a_vsh_known_program(unsigned id,unsigned *count))[4]
+{
+    if(id>=nv2a_vsh_known_count()){*count=0;return NULL;}
+    *count=nv_vsh_compiled[id].count;return nv_vsh_compiled[id].words;
+}
+
+int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    const NvVshCompiled *p = nv2a_vsh_resolve_native();
+    if (p) {
+        ++s_native_runs;
+        p->run(in, out);
+        return 1;
+    }
+    ++s_interpreted_runs;
+    return nv2a_vsh_run_interpreted(in, out);
+}
+
+void nv2a_vsh_report(void)
+{
+    fprintf(stderr, "[VERTEX-NATIVE] enabled=%u variants=%u native_vertices=%llu interpreted_vertices=%llu program_matches=%llu program_misses=%llu\n",
+        (unsigned)(s_native_enabled > 0), (unsigned)NV_VSH_COMPILED_COUNT,
+        (unsigned long long)s_native_runs, (unsigned long long)s_interpreted_runs,
+        (unsigned long long)s_native_matches, (unsigned long long)s_native_misses);
+    s_native_runs = s_interpreted_runs = s_native_matches = s_native_misses = 0;
 }
