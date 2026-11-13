@@ -5,7 +5,7 @@
 #include "frame_trace.h"
 #include "host_time.h"
 
-#define RING_SIZE 1024u
+#define RING_SIZE 4096u
 #define WRITE_BATCH 128u
 #define TRACE_FOOTER 0xFFFFFFFFu
 

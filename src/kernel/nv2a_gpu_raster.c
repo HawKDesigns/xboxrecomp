@@ -161,6 +161,10 @@ static struct {
         int enabled,written;
         uint64_t queued,shared_binds;
     } readonly_depth;
+    struct {
+        int enabled;
+        uint64_t clears, retired, rejected;
+    } depth_clear;
     int skip_empty_stats,stats_required,stats_initialized;
     uint64_t empty_stats_skips,stats_initializations;
     GpuPendingReadback pending[NV_GPU_PENDING_READBACKS];
@@ -1761,6 +1765,51 @@ int nv_gpu_clear_depth(float *depth,unsigned stride,float value)
     /* Match the existing CPU depth-cache clear, which clears the full cache. */
     return gpu_clear(0,0,g.target.width,g.target.height,2,0,value);
 }
+int nv_gpu_retire_depth_on_clear(float *depth,unsigned stride,unsigned rows,float value)
+{
+    if(!g.depth_clear.enabled || !depth || !stride || !rows || !g.pending_count ||
+       !g.native || g.selftest || s_capture || g.auto_enabled ||
+       InterlockedCompareExchange(&s_startup,0,0)!=2)return 0;
+    if(rows>SIZE_MAX/sizeof(*depth)/stride)return 0;
+    size_t bytes=(size_t)stride*rows*sizeof(*depth);
+    unsigned retire=0;
+    /* The CPU overwrite replaces all older depth results for this cache.
+     * Color can still be observed by the guest or aliased by another target.
+     * Reject overlaps that cannot be proven to be depth-only. */
+    for(unsigned i=0;i<g.pending_count;i++) {
+        GpuPendingReadback *p=&g.pending[i];
+        if(!p->publish_surface)continue;
+        if(gpu_host_overlap(depth,bytes,p->host_color,p->color_span))goto reject;
+        if(!p->publish_depth || !gpu_host_overlap(depth,bytes,p->host_depth,p->depth_span))continue;
+        if(p->host_depth!=depth || p->depth_stride!=stride ||
+           p->target.width>stride || p->target.height>rows)goto reject;
+        retire|=1u<<i;
+    }
+    if(!retire)return 0;
+    if(g.active) {
+        if(gpu_host_overlap(depth,bytes,g.host_color,gpu_target_color_bytes(&g.target)))goto reject;
+        if(gpu_host_overlap(depth,bytes,g.host_depth,gpu_target_depth_bytes(&g.target,g.depth_stride))) {
+            if(g.host_depth!=depth || g.depth_stride!=stride ||
+               g.target.width>stride || g.target.height>rows)goto reject;
+            int cleared=nv_gpu_clear_depth(depth,stride,value);
+            if(cleared<0)return -1;
+            if(!cleared)goto reject;
+        }
+    }
+    for(unsigned i=0;i<g.pending_count;i++)if(retire&(1u<<i)) {
+        g.pending[i].publish_depth=0;
+        /* Even a clear to the old CPU baseline invalidates a saved depth image. */
+        g.pending[i].baseline_valid=0;
+        ++g.depth_clear.retired;
+        nv2a_frame_profile_add(NV_FRAME_DEPTH_CLEAR_RETIRED,1);
+    }
+    ++g.depth_clear.clears;
+    return 1;
+
+reject:
+    ++g.depth_clear.rejected;
+    return 0;
+}
 int nv_gpu_reset_report(void)
 {
     if(!nv_gpu_available() || !g.report_shader)return 0;
@@ -2252,6 +2301,8 @@ static int gpu_initialize(void)
     g.bridge.rotation_requested=g.bridge.rotate_surfaces=rotate && atoi(rotate)>0;
     const char *readonly_depth=getenv("RECOMP_GPU_READONLY_DEPTH");
     g.readonly_depth.enabled=readonly_depth && atoi(readonly_depth)>0;
+    const char *depth_clear=getenv("RECOMP_GPU_DEPTH_CLEAR_RETIRE");
+    g.depth_clear.enabled=depth_clear && atoi(depth_clear)>0;
     const char *fast_pending=getenv("RECOMP_GPU_FAST_PENDING_ACCESS");
     g.fast_pending_access=!fast_pending || atoi(fast_pending)>0;
     const char *partial_readback=getenv("RECOMP_GPU_PARTIAL_READBACK");
@@ -3353,6 +3404,12 @@ void nv_gpu_report(void)
     if(g.readonly_depth.enabled)fprintf(stderr,"[GPU-READONLY-DEPTH] queued=%llu shared_binds=%llu\n",
         (unsigned long long)g.readonly_depth.queued,(unsigned long long)g.readonly_depth.shared_binds);
     g.readonly_depth.queued=g.readonly_depth.shared_binds=0;
+    if(g.depth_clear.enabled) {
+        fprintf(stderr,"[GPU-DEPTH-CLEAR-RETIRE] clears=%llu retired=%llu rejected=%llu\n",
+            (unsigned long long)g.depth_clear.clears,(unsigned long long)g.depth_clear.retired,
+            (unsigned long long)g.depth_clear.rejected);
+        g.depth_clear.clears=g.depth_clear.retired=g.depth_clear.rejected=0;
+    }
     static const char *dependency_names[6]={
         "guest-access","guest-read","target-color","target-depth",
         "texture-raw","texture-palette"
@@ -3439,6 +3496,8 @@ int nv_gpu_reset_report(void){return 0;}
 int nv_gpu_clear_color(const NvGpuState*s,uint8_t*c,unsigned l,unsigned t,unsigned r,unsigned b,uint32_t v)
 {(void)s;(void)c;(void)l;(void)t;(void)r;(void)b;(void)v;return 0;}
 int nv_gpu_clear_depth(float*d,unsigned stride,float v){(void)d;(void)stride;(void)v;return 0;}
+int nv_gpu_retire_depth_on_clear(float*d,unsigned stride,unsigned rows,float v)
+{(void)d;(void)stride;(void)rows;(void)v;return 0;}
 int nv_gpu_cpu_write_disjoint(const void*a,size_t bytes){(void)a;(void)bytes;return 0;}
 void nv_gpu_report(void){}
 void nv_gpu_capture_request(void){}

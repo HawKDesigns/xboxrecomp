@@ -1719,7 +1719,8 @@ static void zbuf_clear(void)
     float *z = zbuf_current(1), v = zclear_value();
     int cleared=0;
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
-    cleared=nv_gpu_clear_depth(z,NV_ZBUF_W,v);
+    cleared=nv_gpu_retire_depth_on_clear(z,NV_ZBUF_W,NV_ZBUF_H,v);
+    if(!cleared)cleared=nv_gpu_clear_depth(z,NV_ZBUF_W,v);
     if(cleared<0){fprintf(stderr,"[GPU-RASTER] stopping after depth-clear submission failure\n");exit(4);}
     if(!cleared && z)cleared=nv_gpu_cpu_write_disjoint(z,(size_t)NV_ZBUF_W*NV_ZBUF_H*sizeof *z);
 #endif

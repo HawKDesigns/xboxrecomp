@@ -81,6 +81,9 @@ int nv_gpu_reset_report(void);
 int nv_gpu_clear_color(const NvGpuState *surface,uint8_t *color,
                        unsigned left,unsigned top,unsigned right,unsigned bottom,uint32_t value);
 int nv_gpu_clear_depth(float *depth,unsigned stride,float value);
+/* Only for a full overwrite of the executor's host depth cache.
+ * A positive return allows the caller to overwrite all stride * rows floats. */
+int nv_gpu_retire_depth_on_clear(float *depth,unsigned stride,unsigned rows,float value);
 /* A CPU write needs no readback only when its complete byte range is disjoint
  * from BOTH active color and depth mirrors. Zero requires ordinary sync. */
 int nv_gpu_cpu_write_disjoint(const void *address,size_t bytes);
