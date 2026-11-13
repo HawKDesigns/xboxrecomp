@@ -4,6 +4,7 @@
  * primitive list, preserving depth, alpha and blending without pixel races. */
 #include "nv2a_gpu_raster.h"
 #include "platform/frame_trace.h"
+#include "nv2a_frame_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -551,6 +552,7 @@ static int gpu_readback_current_mode(const char *reason,int enqueued,double enqu
         if(FAILED(hr))goto fail;
     }else if(!g.selftest)++g.empty_stats_skips;
     double unpack_begin=gpu_ms();
+    if(!g.selftest)nv2a_frame_profile_add(NV_FRAME_CURRENT_MAP,unpack_begin-map_begin);
     if(!g.selftest){
         g.readback_time.map_wait_ms+=unpack_begin-map_begin;
         g.target_shape[gpu_target_shape(g.target.width,g.target.height)].map_wait_ms+=unpack_begin-map_begin;
@@ -602,6 +604,7 @@ static int gpu_readback_current_mode(const char *reason,int enqueued,double enqu
         if((v[3]&0xFFFFFF)>(g.completed.pixel_max&0xFFFFFF))g.completed.pixel_max=v[3];
     }
     double unmap_begin=gpu_ms();
+    if(!g.selftest)nv2a_frame_profile_add(NV_FRAME_PUBLICATION,unmap_begin-unpack_begin);
     if(!g.selftest)g.readback_time.counters_ms+=unmap_begin-counters_begin;
     if(g.native)ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)g.surface.readback,0);
     else {
@@ -685,7 +688,10 @@ static int gpu_pending_dependency(unsigned origin,const GpuPendingReadback *p)
     int result=gpu_pending_drain();
     if(!g.selftest) {
         ++g.dependency_source[origin][shape].drains;
-        g.dependency_source[origin][shape].wait_ms+=gpu_ms()-begin;
+        double elapsed=gpu_ms()-begin;
+        g.dependency_source[origin][shape].wait_ms+=elapsed;
+        nv2a_frame_profile_add(NV_FRAME_DEPENDENCY+origin*4+shape,elapsed);
+        nv2a_frame_profile_add(NV_FRAME_TARGET_DRAIN_COUNT+origin,1);
     }
     return result;
 }
@@ -917,6 +923,7 @@ static int gpu_pending_drain(void)
         double copy_begin=gpu_ms();const GpuSurface *pixels=surface.pData;
         if(!g.selftest){
             g.readback_time.map_wait_ms+=copy_begin-begin;
+            nv2a_frame_profile_add(NV_FRAME_QUEUED_MAP,copy_begin-begin);
             g.target_shape[gpu_target_shape(p->target.width,p->target.height)].map_wait_ms+=copy_begin-begin;
         }
         if(p->publish_surface)for(unsigned y=p->top;y<p->bottom;y++) {
@@ -942,7 +949,10 @@ static int gpu_pending_drain(void)
             if((v[3]&0xFFFFFF)>(g.completed.pixel_max&0xFFFFFF))g.completed.pixel_max=v[3];
         }
         double unmap_begin=gpu_ms();
-        if(!g.selftest)g.readback_time.counters_ms+=unmap_begin-counters_begin;
+        if(!g.selftest){
+            g.readback_time.counters_ms+=unmap_begin-counters_begin;
+            nv2a_frame_profile_add(NV_FRAME_PUBLICATION,unmap_begin-copy_begin);
+        }
         if(surface.pData)ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)p->surface,0);
         if(stats.pData)ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)p->stats,0);
         else if(!g.selftest)++g.empty_stats_skips;
@@ -1028,7 +1038,9 @@ int nv_gpu_sync_completion(NvGpuCount *count)
     uint32_t observed=0;memcpy(&observed,mapped.pData,4);
     ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)g.completion.staging,0);
     if(observed!=serial){g.readback_failed=1;fprintf(stderr,"[GPU-COMPLETION] marker mismatch\n");return -1;}
-    ++g.completion.waits;g.completion.wait_ms+=gpu_ms()-begin;
+    double elapsed=gpu_ms()-begin;
+    ++g.completion.waits;g.completion.wait_ms+=elapsed;
+    nv2a_frame_profile_add(NV_FRAME_COMPLETION_MAP,elapsed);
     if(g.active){g.completion.unpublished=1;
         g.completion.avoided_pixels+=(uint64_t)g.target.width*g.target.height;}
     return 1;
@@ -1056,6 +1068,7 @@ int nv_gpu_sync_report(NvGpuCount *count)
             (unsigned long)hr,(unsigned long)ID3D11Device_GetDeviceRemovedReason(g.device));
         return -1;
     }
+    nv2a_frame_profile_add(NV_FRAME_REPORT_MAP,gpu_ms()-begin);
     NvGpuCount result=g.completed;
     const uint32_t *values=stats.pData;
     for(unsigned bin=0;bin<NV_GPU_MAX_TILES;bin++) {
@@ -1255,6 +1268,7 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
     if(!g.selftest){++g.target_binds;
         ++g.target_shape[gpu_target_shape(s->width,s->height)].binds;
         double ms=gpu_ms()-bind_begin;
+        nv2a_frame_profile_add(NV_FRAME_TARGET_BIND,ms);
         if(ms>=25 && g.slow_targets++<32)fprintf(stderr,"[GPU-TARGET-SLOW] size=%ux%u bpp=%u prepare_ms=%.3f\n",s->width,s->height,s->bpp,ms);}
     return 1;
 }
@@ -1670,6 +1684,11 @@ static int gpu_flush(void)
     if(!g.selftest){
         double end=gpu_ms();++g.flush_time.batches;g.flush_time.upload_ms+=upload_end-begin;
         g.flush_time.raw_ms+=raw_end-upload_end;g.flush_time.raster_ms+=end-raw_end;g.flush_time.total_ms+=end-begin;
+        nv2a_frame_profile_add(NV_FRAME_UPLOAD,upload_end-begin);
+        nv2a_frame_profile_add(NV_FRAME_GEOMETRY,raw_end-upload_end);
+        nv2a_frame_profile_add(NV_FRAME_RASTER_SUBMIT,end-raw_end);
+        nv2a_frame_profile_add(NV_FRAME_BATCHES,1);
+        nv2a_frame_profile_add(NV_FRAME_TRIANGLES,g.queued_count);
         if(g.native && g.empty_reject && !g.native_diagnostics){++g.empty_reject_batches;g.empty_reject_triangles+=g.queued_count;}
         ++g.queue_uploads;g.dispatches+=commands;g.groups+=tiles*4;g.submit_ms+=end-begin;
         g.simple_dispatches+=simple_commands;g.simple_tris+=simple_triangles;}

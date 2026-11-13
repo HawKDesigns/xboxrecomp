@@ -77,7 +77,7 @@ void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent 
 static DWORD WINAPI trace_writer(LPVOID arg)
 {
     FILE *file = arg;
-    const uint32_t header[] = {0x52545051u, 1, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
+    const uint32_t header[] = {0x52545051u, 2, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
     if (fwrite(header, sizeof header, 1, file) != 1 || fflush(file))
         goto failed;
     for (;;) {

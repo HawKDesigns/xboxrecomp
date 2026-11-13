@@ -30,6 +30,7 @@
 #include <windows.h>
 #endif
 #include "nv2a_fifo.h"
+#include "nv2a_frame_profile.h"
 
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
@@ -350,12 +351,18 @@ static void fifo_emit(uint32_t subch,uint32_t method,uint32_t param)
         else if(method>=0x0200 && method<=0x0214)kind=8;
         else kind=9;
         ++s_fifo_emit_kind[kind].samples;s_fifo_emit_kind[kind].ms+=ms;
+        if(method==0x17FC){
+            nv2a_frame_profile_add(NV_FRAME_FIFO_DRAW_MS,ms);
+            nv2a_frame_profile_add(NV_FRAME_FIFO_DRAW_SAMPLES,1);
+        }
     }
 }
 uint32_t nv2a_pb_execute_fifo(uint32_t get,uint32_t put,uint32_t lo,uint32_t hi)
 {
     if(s_fifo_timing<0){const char *e=getenv("RECOMP_RENDER_TIMING");s_fifo_timing=e && atoi(e)>0;}
-    double begin=s_fifo_timing?pb_wall_ms():0;
+    int profile=nv2a_frame_profile_enabled();
+    double begin=(s_fifo_timing || profile)?pb_wall_ms():0;
+    if(profile)nv2a_frame_profile_fifo_enter(begin);
     uint32_t words=s_fifo.words,jumps=s_fifo.jumps,calls=s_fifo.calls;
     uint32_t budget=nv2a_pb_exec_fifo_begin();
     uint32_t cursor=nv2a_fifo_run(&s_fifo,get,put,lo,hi,fifo_read,fifo_emit,budget);
@@ -375,8 +382,13 @@ uint32_t nv2a_pb_execute_fifo(uint32_t get,uint32_t put,uint32_t lo,uint32_t hi)
                 cursor,s_fifo.error_word,put,s_fifo.remaining);
         }
     }
+    double end=(s_fifo_timing || profile)?pb_wall_ms():0;
+    if(profile){
+        nv2a_frame_profile_fifo_leave(end);
+        nv2a_frame_profile_add(NV_FRAME_FIFO_WORDS,(uint32_t)(s_fifo.words-words));
+    }
     if(s_fifo_timing){
-        double elapsed=pb_wall_ms()-begin;s_fifo_ms+=elapsed;++s_fifo_polls;
+        double elapsed=end-begin;s_fifo_ms+=elapsed;++s_fifo_polls;
         static unsigned slow;
         if(elapsed>=50 && slow++<32)fprintf(stderr,"[GPU-FIFO-SLOW] execute_ms=%.3f words=%u budget=%u cursor=%08X put=%08X remaining=%u method=%04X\n",
             elapsed,s_fifo.words>=words?s_fifo.words-words:0,budget,cursor,put,s_fifo.remaining,s_fifo.method);

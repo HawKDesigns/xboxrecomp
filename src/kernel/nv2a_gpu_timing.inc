@@ -14,6 +14,7 @@ typedef struct {uint64_t samples,work,min_work,max_work;double ms,max_ms;} GpuSp
 typedef struct {
     ID3D11Query *query[NV_GPU_TIME_QUERY_COUNT];
     unsigned material_done,material_kind,material_runs,material_pick,material_at,shade_done;uint64_t material_work;
+    uint32_t submitted_frame;
     unsigned closed,mask,category;uint64_t work[NV_GPU_TIME_KINDS];
 } GpuTimeSlot;
 static struct {
@@ -63,7 +64,7 @@ static void gpu_timing_poll(void)
         HRESULT hr=ID3D11DeviceContext_GetData(g.context,(ID3D11Asynchronous*)s->query[0],&disjoint,sizeof disjoint,D3D11_ASYNC_GETDATA_DONOTFLUSH);
         if(FAILED(hr)){gpu_timing_release();fprintf(stderr,"[GPU-PROFILE] query failed; diagnostics disabled, rendering unchanged\n");return;}
         if(hr!=0)continue;
-        if(disjoint.Disjoint || !disjoint.Frequency){++gpu_time.invalid;s->closed=0;continue;}
+        if(disjoint.Disjoint || !disjoint.Frequency){++gpu_time.invalid;nv2a_frame_profile_add(NV_FRAME_GPU_INVALID,1);s->closed=0;continue;}
         uint64_t ticks[NV_GPU_TIME_KINDS][2]={{0}};int ready=1;
         for(unsigned k=0;k<NV_GPU_TIME_KINDS && ready;k++)if(s->mask&(1u<<k))for(unsigned j=0;j<2;j++){
             hr=ID3D11DeviceContext_GetData(g.context,(ID3D11Asynchronous*)s->query[1+k*2+j],&ticks[k][j],sizeof ticks[k][j],D3D11_ASYNC_GETDATA_DONOTFLUSH);
@@ -102,8 +103,15 @@ static void gpu_timing_poll(void)
             }
         }
         for(unsigned k=0;k<NV_GPU_TIME_KINDS;k++)if(s->mask&(1u<<k)){
-            if(ticks[k][1]<ticks[k][0]){++gpu_time.invalid;continue;}
+            if(ticks[k][1]<ticks[k][0]){++gpu_time.invalid;nv2a_frame_profile_add(NV_FRAME_GPU_INVALID,1);continue;}
             double ms=(double)(ticks[k][1]-ticks[k][0])*1000.0/(double)disjoint.Frequency;
+            if(s->submitted_frame && xbox_frame_trace_enabled()) {
+                double us=ms*1000.0;
+                xbox_frame_trace_note(XBOX_TRACE_RENDERER,XBOX_TRACE_GPU_SAMPLE,s->submitted_frame,
+                    s->category*NV_GPU_TIME_KINDS+k,
+                    us>=UINT32_MAX?UINT32_MAX:(uint32_t)us,
+                    s->work[k]>=UINT32_MAX?UINT32_MAX:(uint32_t)s->work[k]);
+            }
             ++gpu_time.phase[k].samples;gpu_time.phase[k].work+=s->work[k];gpu_time.phase[k].ms+=ms;
             if(ms>gpu_time.phase[k].max_ms)gpu_time.phase[k].max_ms=ms;
             if(gpu_time.spread){
@@ -132,12 +140,15 @@ static unsigned gpu_timing_batch_begin(int copy)
         if(gpu_time.frame<gpu_time.next_frame || (unsigned)copy!=gpu_time.want_copy)return 0;
         gpu_time.next_frame=gpu_time.frame+NV_GPU_TIME_FRAMES;
     }
+    int profile=nv2a_frame_profile_enabled();
+    if(profile)nv2a_frame_profile_add(NV_FRAME_GPU_SELECTED,1);
     gpu_timing_poll();if(!gpu_time.enabled)return 0;
     for(unsigned i=0;i<NV_GPU_TIME_SLOTS;i++)if(!gpu_time.slot[i].closed){
         GpuTimeSlot *s=&gpu_time.slot[i];s->mask=0;s->category=category;s->material_done=s->material_runs=s->material_pick=s->material_at=s->shade_done=0;memset(s->work,0,sizeof s->work);gpu_time.active=i+1;
+        s->submitted_frame=profile?nv2a_frame_profile_next_id():0;
         ID3D11DeviceContext_Begin(g.context,(ID3D11Asynchronous*)s->query[0]);return i+1;
     }
-    ++gpu_time.dropped;if(gpu_time.spread)++gpu_time.population[category].dropped;return 0;
+    ++gpu_time.dropped;if(profile)nv2a_frame_profile_add(NV_FRAME_GPU_DROPPED,1);if(gpu_time.spread)++gpu_time.population[category].dropped;return 0;
 }
 static void gpu_timing_phase_begin(unsigned kind,uint64_t work)
 {
@@ -196,7 +207,10 @@ static void gpu_timing_shade_end(void)
 }
 static void gpu_timing_frame(void)
 {
-    if(InterlockedCompareExchange(&s_startup,0,0)==2)++gpu_time.frame;
+    if(InterlockedCompareExchange(&s_startup,0,0)==2) {
+        ++gpu_time.frame;
+        if(nv2a_frame_profile_enabled())gpu_timing_poll();
+    }
 }
 static void gpu_timing_report(void)
 {

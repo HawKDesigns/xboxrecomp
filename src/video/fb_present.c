@@ -310,6 +310,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
         return 0;                       /* auto-repeat of Alt+Enter */
+    if ((m == WM_KEYDOWN || m == WM_KEYUP) && w == VK_F3 && xbox_frame_trace_enabled()) {
+        static int paused;
+        if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
+            paused = !paused;
+            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_PAUSE, 0, paused, 0, 0);
+        }
+        return 0;
+    }
     if ((m == WM_KEYDOWN || m == WM_KEYUP) && w >= VK_F4 && w <= VK_F7 &&
         xbox_frame_trace_enabled()) {
         if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {

@@ -30,6 +30,7 @@
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
+#include "platform/frame_trace.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -7881,11 +7882,21 @@ int xbox_KeWaitGuestFence(uint32_t event_va, uint32_t issued_va,
     DWORD started=GetTickCount(), reported=started;
     unsigned timeouts=0,notifications=0;
     int trace=-1;
+#ifdef XBOX_FRAME_TELEMETRY
+    uint64_t profile_started=0;
+#endif
     for (;;) {
         uint32_t completed=BRIDGE_MEM32(completed_va);
         uint32_t issued=BRIDGE_MEM32(issued_va);
         if ((uint32_t)(issued-requested)>=(uint32_t)(issued-completed)) {
             if (trace>=0) bridge_wait_end(trace);
+#ifdef XBOX_FRAME_TELEMETRY
+            if (profile_started) {
+                uint64_t us=(xbox_HostNowNs()-profile_started)/1000u;
+                xbox_frame_trace_note(XBOX_TRACE_TITLE,XBOX_TRACE_GUEST_FENCE_WAIT,0,
+                    us>=UINT32_MAX?UINT32_MAX:(uint32_t)us,timeouts,notifications);
+            }
+#endif
             static LONG shown;
             if ((timeouts || notifications) && InterlockedIncrement(&shown)<=16) {
                 fprintf(stderr,"[GPU-FENCE-WAIT] completed=%08X requested=%08X event=%08X timeouts=%u notifications=%u elapsed_ms=%u\n",
@@ -7903,6 +7914,9 @@ int xbox_KeWaitGuestFence(uint32_t event_va, uint32_t issued_va,
          * late/missed guest interrupt need not wait for a Windows timeout tick.
          * Rechecking the completion predicate still rejects unrelated wakes. */
         if(trace<0)trace=bridge_wait_begin(159,event_va,event,0);
+#ifdef XBOX_FRAME_TELEMETRY
+        if (!profile_started && xbox_frame_trace_enabled())profile_started=xbox_HostNowNs();
+#endif
         int changed=xbox_Nv2aWaitFenceChange(completed_va,completed,2);
         if(changed>0){if(changed==1)++timeouts;else ++notifications;continue;}
         /* Native condition failure retains V62's completed-fence polling. */

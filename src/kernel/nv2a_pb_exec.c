@@ -34,6 +34,7 @@
 #include "nv2a_overlay_revision.h"
 #include "nv2a_frame_pacing.h"
 #include "platform/frame_trace.h"
+#include "nv2a_frame_profile.h"
 static NvFramePacing s_frame_pacing;
 unsigned nv2a_pb_exec_overlay_revision(void) { return QPR2_RENDERER_REVISION; }
 #if defined(_WIN32)
@@ -3993,7 +3994,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         {
             extern void xbox_FramebufferWindowFrameStats(uint32_t);
             static uint32_t draws_at_flip;
-            xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
+            uint32_t draws = s_gpu.draws - draws_at_flip;
+            xbox_FramebufferWindowFrameStats(draws);
+            if(nv2a_frame_profile_enabled())
+                nv2a_frame_profile_flip(frame_id,draws,render_wall_ms());
             draws_at_flip = s_gpu.draws;
         }
         if (s_gpu.pitch) {
