@@ -89,6 +89,8 @@ static struct {
         ID3D11ComputeShader *shader;
         GpuBuffer parameters,texels;
         uint64_t serial,snapshots,packs,hits,bytes,eligible,misses;
+        int rotation_requested,rotate_surfaces;
+        uint64_t rotations,snapshot_bytes_avoided;
     } bridge;
     struct {
         int enabled,testing,active,retire_pixels;
@@ -379,13 +381,21 @@ static void gpu_buffer_release(GpuBuffer *b)
     free(b->upload_copy);
     memset(b,0,sizeof *b);
 }
-static int gpu_buffer_create(GpuBuffer *b, unsigned bytes, unsigned stride, int output)
+enum GpuBufferAccess {
+    GPU_BUFFER_INPUT,
+    GPU_BUFFER_OUTPUT,
+    GPU_BUFFER_SHARED,
+    GPU_BUFFER_SHARED_READBACK
+};
+static int gpu_buffer_create(GpuBuffer *b, unsigned bytes, unsigned stride, enum GpuBufferAccess access)
 {
     D3D11_BUFFER_DESC desc;D3D11_SUBRESOURCE_DATA data;
     memset(&desc,0,sizeof desc);memset(&data,0,sizeof data);
     desc.ByteWidth=bytes;desc.Usage=D3D11_USAGE_DEFAULT;
-    desc.BindFlags=output==2?(D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_SHADER_RESOURCE):
-        (output?D3D11_BIND_UNORDERED_ACCESS:D3D11_BIND_SHADER_RESOURCE);
+    const int output=access!=GPU_BUFFER_INPUT;
+    const int shader_input=access!=GPU_BUFFER_OUTPUT;
+    desc.BindFlags=(output?D3D11_BIND_UNORDERED_ACCESS:0) |
+        (shader_input?D3D11_BIND_SHADER_RESOURCE:0);
     desc.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;desc.StructureByteStride=stride;
     if (FAILED(ID3D11Device_CreateBuffer(g.device,&desc,NULL,&b->buffer))) goto fail;
     b->bytes=bytes;b->stride=stride;
@@ -397,9 +407,9 @@ static int gpu_buffer_create(GpuBuffer *b, unsigned bytes, unsigned stride, int 
         desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
         /* Staging buffers have no structured-buffer bindings or misc flags. */
         desc.MiscFlags=0;desc.StructureByteStride=0;
-        if (output==1 && FAILED(ID3D11Device_CreateBuffer(g.device,&desc,NULL,&b->readback))) goto fail;
+        if (access!=GPU_BUFFER_SHARED && FAILED(ID3D11Device_CreateBuffer(g.device,&desc,NULL,&b->readback))) goto fail;
     }
-    if(output!=1) {
+    if(shader_input) {
         D3D11_SHADER_RESOURCE_VIEW_DESC view;memset(&view,0,sizeof view);
         view.Format=DXGI_FORMAT_UNKNOWN;view.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;
         view.Buffer.NumElements=bytes/stride;
@@ -754,6 +764,44 @@ static int gpu_staging_buffer(ID3D11Buffer **buffer,unsigned *capacity,unsigned 
     if(*buffer)ID3D11Buffer_Release(*buffer);
     *buffer=next;*capacity=bytes;return 1;
 }
+static int gpu_queue_snapshot(GpuPendingReadback *pending)
+{
+    int rotate=g.bridge.rotate_surfaces && g.surface.srv;
+    GpuBuffer *snapshot=&pending->snapshot;
+    if(snapshot->bytes!=g.surface.bytes || (rotate && !snapshot->uav)) {
+        GpuBuffer replacement={0};
+        if(!gpu_buffer_create(&replacement,g.surface.bytes,8,
+                             rotate?GPU_BUFFER_SHARED:GPU_BUFFER_INPUT)) {
+            if(!rotate)return 0;
+            /* Allocation pressure must not discard the live target. Retry the
+             * established snapshot-copy path with its smaller binding set. */
+            rotate=g.bridge.rotate_surfaces=0;
+            if(snapshot->bytes!=g.surface.bytes &&
+               !gpu_buffer_create(&replacement,g.surface.bytes,8,GPU_BUFFER_INPUT))return 0;
+        }
+        if(replacement.buffer) {
+            gpu_buffer_release(snapshot);
+            *snapshot=replacement;
+        }
+    }
+    if(rotate) {
+        /* A queued slot owns the finished surface until publication. Move
+         * only its device storage. Current-target staging stays with g.surface. */
+        GpuBuffer finished=g.surface;
+        g.surface=*snapshot;
+        g.surface.readback=finished.readback;
+        finished.readback=NULL;
+        *snapshot=finished;
+        if(!g.selftest) {
+            ++g.bridge.rotations;
+            g.bridge.snapshot_bytes_avoided+=finished.bytes;
+        }
+    } else {
+        ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)snapshot->buffer,
+                                        (ID3D11Resource*)g.surface.buffer);
+    }
+    return 1;
+}
 static int gpu_queue_readback(void)
 {
     if(!g.active)return 1;
@@ -773,17 +821,12 @@ static int gpu_queue_readback(void)
     }
     p->serial=0;
     if(g.bridge.enabled && (!g.selftest || g.bridge.testing) && !s_capture && g.target.bpp==4) {
-        if(p->snapshot.bytes!=g.surface.bytes) {
-            gpu_buffer_release(&p->snapshot);
-            if(!gpu_buffer_create(&p->snapshot,g.surface.bytes,8,0)) {
-                g.bridge.enabled=0;
-                fprintf(stderr,"[GPU-TEXTURE-BRIDGE] snapshot allocation failed; CPU texture dependencies retained\n");
-            }
-        }
-        if(g.bridge.enabled) {
-            ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)p->snapshot.buffer,(ID3D11Resource*)g.surface.buffer);
+        if(gpu_queue_snapshot(p)) {
             p->serial=++g.bridge.serial;
             if(!g.selftest)++g.bridge.snapshots;
+        } else {
+            g.bridge.enabled=0;
+            fprintf(stderr,"[GPU-TEXTURE-BRIDGE] snapshot allocation failed; CPU texture dependencies retained\n");
         }
     }
     gpu_resume_save(p);
@@ -799,7 +842,8 @@ static int gpu_queue_readback(void)
     if(defer_surface) {
         p->surface_copy_pending=1;
         if(!g.selftest)++g.deferred_readback.deferred;
-    } else gpu_copy_dirty_surface((ID3D11Resource*)p->surface,(ID3D11Resource*)g.surface.buffer,
+    } else gpu_copy_dirty_surface((ID3D11Resource*)p->surface,
+        (ID3D11Resource*)(p->serial?p->snapshot.buffer:g.surface.buffer),
         g.target.width,g.target.height,g.dirty_top,g.dirty_bottom);
     if(p->has_stats)ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)p->stats,(ID3D11Resource*)g.stats.buffer);
     if(timing){gpu_timing_phase_end(NV_GPU_TIME_COPY);gpu_timing_batch_end(timing);}
@@ -1101,7 +1145,13 @@ static int gpu_target_buffers(unsigned bytes)
     double begin=gpu_ms();
     if(hit)next=g.target_spare[slot];
     else {
-        if(g.native){if(!gpu_buffer_create(&next.surface,bytes*2,8,1))return 0;}
+        if(g.native){
+            if(g.bridge.rotate_surfaces &&
+               !gpu_buffer_create(&next.surface,bytes*2,8,GPU_BUFFER_SHARED_READBACK))
+                g.bridge.rotate_surfaces=0;
+            if(!next.surface.buffer && !gpu_buffer_create(&next.surface,bytes*2,8,GPU_BUFFER_OUTPUT))
+                return 0;
+        }
         else if(!gpu_buffer_create(&next.color,bytes,4,1) || !gpu_buffer_create(&next.depth,bytes,4,1)) {
             gpu_buffer_release(&next.color);gpu_buffer_release(&next.depth);return 0;
         }
@@ -2170,6 +2220,8 @@ static int gpu_initialize(void)
     if(!enabled || atoi(enabled)<=0)return 0;
     const char *defer=getenv("RECOMP_GPU_DEFER_READBACK");
     g.deferred_readback.enabled=!defer || atoi(defer)>0;
+    const char *rotate=getenv("RECOMP_GPU_ROTATE_SURFACES");
+    g.bridge.rotation_requested=g.bridge.rotate_surfaces=rotate && atoi(rotate)>0;
     const char *readonly_depth=getenv("RECOMP_GPU_READONLY_DEPTH");
     g.readonly_depth.enabled=readonly_depth && atoi(readonly_depth)>0;
     const char *fast_pending=getenv("RECOMP_GPU_FAST_PENDING_ACCESS");
@@ -2470,7 +2522,7 @@ static int gpu_initialize(void)
         int ok=gpu_bridge_selftest();g.bridge.testing=g.readback_queue_test=0;
         if(ok<0 || g.readback_failed)goto fail;
         if(!ok) {
-            g.bridge.enabled=0;
+            g.bridge.enabled=g.bridge.rotate_surfaces=0;
             fprintf(stderr,"[GPU-TEXTURE-BRIDGE] offscreen mismatch; CPU dependencies retained\n");
         } else fprintf(stderr,"[GPU-TEXTURE-BRIDGE] exact producer/consumer comparison passed\n");
     }
@@ -3227,6 +3279,11 @@ void nv_gpu_report(void)
         (unsigned long long)g.bridge.hits,(unsigned long long)g.bridge.bytes,
         (unsigned long long)g.bridge.eligible,(unsigned long long)g.bridge.misses);
     g.bridge.snapshots=g.bridge.packs=g.bridge.hits=g.bridge.bytes=g.bridge.eligible=g.bridge.misses=0;
+    if(g.bridge.rotation_requested)
+        fprintf(stderr,"[GPU-SURFACE-ROTATION] enabled=%u rotations=%llu snapshot_bytes_avoided=%llu\n",
+            (unsigned)(g.bridge.enabled && g.bridge.rotate_surfaces),
+            (unsigned long long)g.bridge.rotations,(unsigned long long)g.bridge.snapshot_bytes_avoided);
+    g.bridge.rotations=g.bridge.snapshot_bytes_avoided=0;
     fprintf(stderr,"[GPU-CPU-WRITE] disjoint_clears=%llu\n",(unsigned long long)g.disjoint_writes);
     g.disjoint_writes=0;
     fprintf(stderr,"[GPU-BACKEND-AUTO] enabled=%u tested=%u selected=%s native_ms=%.3f compute_ms=%.3f\n",
