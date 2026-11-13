@@ -33,6 +33,7 @@
 #include "xbox_bus_address.h"
 #include "nv2a_overlay_revision.h"
 #include "nv2a_frame_pacing.h"
+#include "platform/frame_trace.h"
 static NvFramePacing s_frame_pacing;
 unsigned nv2a_pb_exec_overlay_revision(void) { return QPR2_RENDERER_REVISION; }
 #if defined(_WIN32)
@@ -3964,7 +3965,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         frame_trace_flip();
         return;
 
-    case NV097_FLIP_STALL:
+    case NV097_FLIP_STALL: {
+        static uint32_t completed_frame_id;
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
@@ -3974,6 +3976,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        uint32_t frame_id = ++completed_frame_id;
+#ifdef XBOX_FRAME_TELEMETRY
+        if (xbox_frame_trace_enabled())
+            xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_FLIP, frame_id,
+                xbox_frame_trace_guest_tick_count(), xbox_VblankCount(), s_gpu.flips);
+#endif
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew
@@ -3989,7 +3997,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             draws_at_flip = s_gpu.draws;
         }
         if (s_gpu.pitch) {
-            extern void xbox_FramebufferWindowPresentPixels(const uint32_t *, uint32_t, uint32_t);
+            extern void xbox_FramebufferWindowPresentPixels(const uint32_t *, uint32_t, uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
@@ -3998,7 +4006,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 uint32_t bpp=s_gpu.drawn_offset?s_gpu.drawn_bpp:surface_bpp();
                 if(snapshot_presented_frame(done,pitch,bpp)) {
                     xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                    xbox_FramebufferWindowPresentPixels(s_completed_frame,640,480);
+                    xbox_FramebufferWindowPresentPixels(s_completed_frame, 640, 480, frame_id);
                     nv_frame_pacing_note(&s_frame_pacing,render_wall_ms());
                 }
             }
@@ -4035,7 +4043,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         return;
-
+    }
 
     /* Vertex programs and their constants: forwarded as they arrive. */
     case 0x1E94:                                  /* TRANSFORM_EXECUTION_MODE */

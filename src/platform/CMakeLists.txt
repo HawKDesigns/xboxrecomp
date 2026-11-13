@@ -37,7 +37,13 @@ target_include_directories(host_time PUBLIC
 )
 
 if(WIN32)
+    add_library(xbox_frame_trace STATIC frame_trace.c)
+    target_compile_definitions(xbox_frame_trace PUBLIC XBOX_FRAME_TELEMETRY=1)
+    target_compile_definitions(xbox_frame_trace PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(xbox_frame_trace PUBLIC ${XBOXRECOMP_SRC_DIR})
+    target_link_libraries(xbox_frame_trace PRIVATE host_time)
     add_library(platform INTERFACE)
+    target_link_libraries(platform INTERFACE xbox_frame_trace)
     target_link_libraries(platform INTERFACE host_time)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
     target_link_libraries(platform INTERFACE recomp_exit_hook)

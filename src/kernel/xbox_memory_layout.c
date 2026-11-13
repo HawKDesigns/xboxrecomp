@@ -20,6 +20,7 @@
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "main_pc_samples.h"
+#include "platform/frame_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1402,6 +1403,7 @@ static void frame_counters_tick(void)
         counter = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
                                        + g_memory_offset);
         *counter += (uint32_t)elapsed_frames;
+        xbox_frame_trace_guest_ticks((uint32_t)elapsed_frames);
         /* A delayed poll advances all missed display ticks, but a notification
          * KEVENT holds one signal until reset. Never signal on registration,
          * a flip alone, or a poll where no display period elapsed. */
@@ -2654,6 +2656,9 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * its last second is past the header. Bounded, in case the frame
      * thread is wedged inside a write. */
     apu_wav_close_nowait(500);
+#ifdef XBOX_FRAME_TELEMETRY
+    xbox_frame_trace_stop();
+#endif
     /* Do not run CRT or DLL shutdown from a watchdog thread: either can wait
      * on a lock held by the guest and leave the process alive after the log
      * says the watchdog fired. TerminateProcess is intentional here because

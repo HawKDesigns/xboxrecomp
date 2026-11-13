@@ -167,16 +167,16 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     return 1;
 }
 
-/* Returns 0 when nothing was shown: the window is occluded or the display
- * is off, and Present does not wait for vsync then -- the caller must pace
- * itself instead of spinning. The pixels are read before this returns. */
-int gpu_present_frame(const uint32_t *pixels)
+/* Returns whether Present paced the caller. Report successful presentation
+ * separately, including when vsync is off. */
+int gpu_present_frame(const uint32_t *pixels, int *shown)
 {
     static const float black[4] = {0, 0, 0, 1};
     D3D11_VIEWPORT vp;
     uint32_t cw, ch;
     float sx, sy;
 
+    *shown = 0;
     if (!s_rtv || !pixels)
         return 0;
     client_size(&cw, &ch);
@@ -212,7 +212,8 @@ int gpu_present_frame(const uint32_t *pixels)
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     /* Paced only when Present waited for the vblank: with RECOMP_PRESENT_VSYNC=0
      * the caller keeps its own 16 ms sleep instead of spinning a core. */
-    return IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK && s_vsync;
+    *shown = IDXGISwapChain_Present(s_chain, (UINT)s_vsync, 0) == S_OK;
+    return *shown && s_vsync;
 }
 
 void gpu_present_shutdown(void)

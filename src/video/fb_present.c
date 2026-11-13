@@ -39,6 +39,7 @@
  * them. */
 #include "keyboard.h"   /* src/input */
 #include "gpu_present.h"
+#include "platform/frame_trace.h"
 #include "recomp_exit_hook.h"   /* src/platform */
 #include <stdbool.h>
 #include "pvideo_scanout.h"
@@ -65,6 +66,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * The lock also protects the window's copy: two flips can otherwise reuse
  * the buffer the window is still reading. */
 static uint32_t     *s_present[2];
+static uint32_t      s_present_frame_id;
 static LONG          s_present_idx = -1;   /* -1 until the first flip */
 static SRWLOCK       s_present_lock = SRWLOCK_INIT;
 
@@ -134,7 +136,7 @@ static void fb_overlay(void)
 
 /* Publish a resolved frame using the same lock as guest-memory flips. */
 void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
-                                        uint32_t width, uint32_t height)
+                                        uint32_t width, uint32_t height, uint32_t frame_id)
 {
     if (!s_fb_running || !pixels || width != s_fb_width ||
         height != s_fb_height || getenv("RECOMP_FB_VA"))
@@ -148,6 +150,8 @@ void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
     if (s_present[next]) {
         memcpy(s_present[next], pixels, bytes);
         s_present_idx = next;
+        s_present_frame_id = frame_id;
+        xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_HANDOFF, frame_id, 0, 0, 0);
     }
     ReleaseSRWLockExclusive(&s_present_lock);
 }
@@ -225,10 +229,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         }
     }
     s_present_idx = next;
+    s_present_frame_id = 0;
     ReleaseSRWLockExclusive(&s_present_lock);
 }
 
-static int fb_copy_presented_frame(uint32_t *dst)
+static int fb_copy_presented_frame(uint32_t *dst, uint32_t *frame_id)
 {
     int copied = 0;
 
@@ -236,6 +241,7 @@ static int fb_copy_presented_frame(uint32_t *dst)
     if (s_present_idx >= 0) {
         memcpy(dst, s_present[s_present_idx],
                (size_t)s_fb_width * s_fb_height * 4);
+        *frame_id = s_present_frame_id;
         copied = 1;
     }
     ReleaseSRWLockShared(&s_present_lock);
@@ -304,6 +310,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
         return 0;                       /* auto-repeat of Alt+Enter */
+    if ((m == WM_KEYDOWN || m == WM_KEYUP) && w >= VK_F4 && w <= VK_F7 &&
+        xbox_frame_trace_enabled()) {
+        if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
+            const enum XboxTracePhase phases[] = {XBOX_PHASE_UNMARKED, XBOX_PHASE_COUNTDOWN,
+                                                  XBOX_PHASE_AHEAD, XBOX_PHASE_BEHIND};
+            enum XboxTracePhase phase = phases[w - VK_F4];
+            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_PHASE, 0, phase, 1, 0);
+        }
+        return 0;
+    }
     switch (m) {
     case WM_CLOSE:
         InterlockedExchange(&s_fb_closed, 1);
@@ -321,6 +337,9 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         InterlockedExchange(&s_fb_running, 0);
         if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
             fprintf(stderr, "  [FBWIN] window closed: exiting\n");
+#ifdef XBOX_FRAME_TELEMETRY
+            xbox_frame_trace_stop();
+#endif
             recomp_exit_hook_run("window");
             fflush(stdout);
             fflush(stderr);
@@ -484,7 +503,7 @@ int xbox_FramebufferDumpBmp(const char *path)
 
 /* GDI: the frame letterboxed into the client area, like the D3D11
  * presenter; the borders are cleared when the size changes. */
-static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+static int gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
 {
     static LONG lw, lh;
     RECT c;
@@ -492,7 +511,7 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
     GetClientRect(hwnd, &c);
     cw = c.right - c.left; ch = c.bottom - c.top;
     if (cw <= 0 || ch <= 0)
-        return;
+        return 0;
     if (cw != lw || ch != lh) {
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
@@ -504,18 +523,19 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
     }
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
-    StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
-                  0, 0, (int)s_fb_width, (int)s_fb_height,
-                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+    int lines = StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
+                             0, 0, (int)s_fb_width, (int)s_fb_height,
+                             s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+    return lines != 0 && lines != GDI_ERROR;
 }
 
 /* The converted frame in s_rgb, on screen: D3D11 when it is up (which waits
  * for vsync, so returns 1 when the loop is already paced), else GDI. */
-static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, int *shown)
 {
     if (gpu_present_active())
-        return gpu_present_frame(s_rgb);
-    gdi_blit(hwnd, hdc, bi);
+        return gpu_present_frame(s_rgb, shown);
+    *shown = gdi_blit(hwnd, hdc, bi);
     return 0;
 }
 
@@ -526,6 +546,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     BITMAPINFO bi;
     RECT r;
     int fb_pinned;
+    uint32_t last_drawn = 0;
 
     (void)unused;
 
@@ -595,18 +616,19 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
-        int paced = 0;
+        int paced = 0, shown = 0;
+        uint32_t frame_id = 0;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_rgb && fb_copy_presented_frame(s_rgb)) {
+        if (s_rgb && fb_copy_presented_frame(s_rgb, &frame_id)) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
             if (!fb_pinned)
                 fb_overlay();
-            paced = fb_show(hwnd, hdc, &bi);
+            paced = fb_show(hwnd, hdc, &bi, &shown);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
@@ -615,7 +637,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             fb_convert(src, s_fb_pitch / s_fb_width);
             if (!fb_pinned)
                 fb_overlay();
-            paced = fb_show(hwnd, hdc, &bi);
+            paced = fb_show(hwnd, hdc, &bi, &shown);
+        }
+        if (shown && frame_id && frame_id != last_drawn) {
+            last_drawn = frame_id;
+            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_DRAW, frame_id, 0, 0, 0);
         }
         {
             /* One dump a few seconds in, so the title has had time to render

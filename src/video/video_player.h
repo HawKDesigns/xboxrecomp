@@ -62,7 +62,7 @@ void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 #ifdef _WIN32
 void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
-                                        uint32_t width, uint32_t height);
+                                        uint32_t width, uint32_t height, uint32_t frame_id);
 #endif
 /* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
 void xbox_FramebufferWindowSetAA(uint32_t sy);

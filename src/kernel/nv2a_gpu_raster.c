@@ -3,6 +3,7 @@
  * triangle. Each compute group owns one 16x16 tile and replays its ordered
  * primitive list, preserving depth, alpha and blending without pixel races. */
 #include "nv2a_gpu_raster.h"
+#include "platform/frame_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -270,10 +271,26 @@ static volatile LONG s_capture_requested;
 static FILE *s_capture;
 static uint64_t s_capture_bytes,s_capture_versions[128];
 static unsigned s_capture_presents;
+static int s_capture_timed;
+static void gpu_capture_trace_begin(void)
+{
+    if (!s_capture_timed) {
+        s_capture_timed = 1;
+        xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_CAPTURE_BEGIN, 0, 0, 0, 0);
+    }
+}
+static void gpu_capture_trace_end(void)
+{
+    if (s_capture_timed) {
+        xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_CAPTURE_END, 0, 0, 0, 0);
+        s_capture_timed = 0;
+    }
+}
 static void gpu_capture_close(const char *reason)
 {
     if(!s_capture)return;
     fclose(s_capture);s_capture=NULL;
+    gpu_capture_trace_end();
     fprintf(stderr,"[GPU-CAPTURE] stopped reason=%s bytes=%llu presents=%u\n",reason,
         (unsigned long long)s_capture_bytes,s_capture_presents);
 }
@@ -312,10 +329,24 @@ static int gpu_resume_selftest(void);
 static int gpu_capture_begin(void)
 {
     if(g.selftest || !InterlockedExchange(&s_capture_requested,0))return 1;
-    if(!gpu_readback("capture-begin"))return 0;
-    gpu_capture_close("new request");const char *path=getenv("RECOMP_GPU_CAPTURE");
-    if(!path || !*path)return 1;
-    s_capture=fopen(path,"wb");if(!s_capture){fprintf(stderr,"[GPU-CAPTURE] cannot open file\n");return 1;}
+    gpu_capture_trace_begin();
+    if(!gpu_readback("capture-begin")) {
+        if (!s_capture) gpu_capture_trace_end();
+        return 0;
+    }
+    gpu_capture_close("new request");
+    const char *path=getenv("RECOMP_GPU_CAPTURE");
+    if(!path || !*path) {
+        gpu_capture_trace_end();
+        return 1;
+    }
+    gpu_capture_trace_begin();
+    s_capture=fopen(path,"wb");
+    if(!s_capture) {
+        gpu_capture_trace_end();
+        fprintf(stderr,"[GPU-CAPTURE] cannot open file\n");
+        return 1;
+    }
     uint32_t h[4]={0x51475235u,1,sizeof(NvGpuState),sizeof(NvGpuTri)};
     if(fwrite(h,sizeof h,1,s_capture)!=1){gpu_capture_close("write failure");return 1;}
     s_capture_bytes=sizeof h;s_capture_presents=0;memset(s_capture_versions,0,sizeof s_capture_versions);
