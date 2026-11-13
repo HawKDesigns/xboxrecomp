@@ -252,6 +252,7 @@ static NvRawMesh *gpu_raw_mesh(const NvRawInput *in)
  * running any vertex program. Outward rounding and a full-pixel guard retain
  * uncertain/near-plane/boundary draws on the exact CPU clipper. */
 typedef struct {double lo,hi;} RawInterval;
+enum RawBoundaryReason {RAW_NUMERIC, RAW_W, RAW_XY, RAW_Z, RAW_POINT_LIMIT};
 static RawInterval raw_interval(double a,double b){RawInterval r={a,b};return r;}
 static RawInterval raw_interval_mul(RawInterval a,RawInterval b)
 {
@@ -261,8 +262,9 @@ static RawInterval raw_interval_mul(RawInterval a,RawInterval b)
 }
 static RawInterval raw_interval_add(RawInterval a,RawInterval b)
 {return raw_interval(nextafterf((float)(a.lo+b.lo),-INFINITY),nextafterf((float)(a.hi+b.hi),INFINITY));}
-static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
+static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in,unsigned *reason)
 {
+    *reason=RAW_NUMERIC;
     RawInterval clip[4];
     for(int row=0;row<4;row++){
         if(in->position_kind==2)clip[row]=raw_interval(m->lo[row],m->hi[row]);
@@ -273,7 +275,7 @@ static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
         if(!isfinite(clip[row].lo) || !isfinite(clip[row].hi))return 0;
     }
     if(clip[3].hi<0.001)return -1;
-    if(clip[3].lo<=0.01 || clip[3].hi>1e12)return 0;
+    if(clip[3].lo<=0.01 || clip[3].hi>1e12){*reason=RAW_W;return 0;}
     RawInterval reciprocal=raw_interval(1.0/clip[3].hi,1.0/clip[3].lo);
     /* Reject reciprocal-clamp/denormal/cancellation regimes, which retain
      * the original exact interpreter/clipper rather than guessing. */
@@ -289,8 +291,8 @@ static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
        screen[1].hi<(double)in->params.top-1 || screen[1].lo>(double)in->params.bottom+1)return -1;
     if(in->zclip && (screen[2].hi<(double)in->zmin-1 || screen[2].lo>(double)in->zmax+1))return -1;
     if(screen[0].lo<(double)in->params.left+1 || screen[0].hi>(double)in->params.right-1 ||
-       screen[1].lo<(double)in->params.top+1 || screen[1].hi>(double)in->params.bottom-1)return 0;
-    if(in->zclip && (screen[2].lo<(double)in->zmin+1e-3 || screen[2].hi>(double)in->zmax-1e-3))return 0;
+       screen[1].lo<(double)in->params.top+1 || screen[1].hi>(double)in->params.bottom-1){*reason=RAW_XY;return 0;}
+    if(in->zclip && (screen[2].lo<(double)in->zmin+1e-3 || screen[2].hi>(double)in->zmax-1e-3)){*reason=RAW_Z;return 0;}
     return 1;
 }
 /* An object AABB loses correlation between coordinate extrema. Per-vertex
@@ -300,16 +302,18 @@ static int gpu_raw_box_bounds(const NvRawMesh *m,const NvRawInput *in)
  * of magnitude. Cancellation uses the sum of ABSOLUTE products, never the
  * small final dot. This avoids dozens of nextafterf calls per vertex while
  * retaining a strictly inward accept / outward reject margin. */
-static int gpu_raw_point_bounds(const NvRawMesh *m,const NvRawInput *in)
+static int gpu_raw_point_bounds(const NvRawMesh *m,const NvRawInput *in,unsigned *reason)
 {
     if(!raw.point_bounds_enabled || !m->vertices || !m->bytes || m->vertices>256u){
         if(!g.selftest && raw.point_bounds_enabled && m->vertices>256u)++raw.point_large;
+        if(raw.point_bounds_enabled)*reason=RAW_POINT_LIMIT;
         return 0;
     }
     if(!g.selftest)++raw.point_attempted;
     raw.ref_bytes=m->bytes;raw.ref_attrs=m->attrs;
-    int inside=1,all_left=1,all_right=1,all_top=1,all_bottom=1;
+    int inside_xy=1,inside_z=1,all_left=1,all_right=1,all_top=1,all_bottom=1;
     int all_near=in->zclip,all_far=in->zclip;
+    *reason=RAW_NUMERIC;
     for(unsigned v=0;v<m->vertices;v++){
         NvRawVec p=nv_raw_attribute(0,v,0);double lo[4],hi[4];
         for(int row=0;row<4;row++){
@@ -326,7 +330,7 @@ static int gpu_raw_point_bounds(const NvRawMesh *m,const NvRawInput *in)
             if(!isfinite(lo[row]) || !isfinite(hi[row]) ||
                fabs(lo[row])>1e30 || fabs(hi[row])>1e30)goto uncertain;
         }
-        if(lo[3]<=0.01 || hi[3]>1e12)goto uncertain;
+        if(lo[3]<=0.01 || hi[3]>1e12){*reason=RAW_W;goto uncertain;}
         double reciprocal_lo=1.0/hi[3],reciprocal_hi=1.0/lo[3];
         if(reciprocal_lo<5.42101e-20 || reciprocal_hi>1.884467e19)goto uncertain;
         for(int j=0;j<3;j++){
@@ -340,15 +344,15 @@ static int gpu_raw_point_bounds(const NvRawMesh *m,const NvRawInput *in)
             if(!isfinite(screen_lo) || !isfinite(screen_hi) ||
                fabs(screen_lo)>1e8 || fabs(screen_hi)>1e8)goto uncertain;
             if(j==0){
-                inside&=screen_lo>=(double)in->params.left+1 && screen_hi<=(double)in->params.right-1;
+                inside_xy&=screen_lo>=(double)in->params.left+1 && screen_hi<=(double)in->params.right-1;
                 all_left&=screen_hi<(double)in->params.left-1;
                 all_right&=screen_lo>(double)in->params.right+1;
             }else if(j==1){
-                inside&=screen_lo>=(double)in->params.top+1 && screen_hi<=(double)in->params.bottom-1;
+                inside_xy&=screen_lo>=(double)in->params.top+1 && screen_hi<=(double)in->params.bottom-1;
                 all_top&=screen_hi<(double)in->params.top-1;
                 all_bottom&=screen_lo>(double)in->params.bottom+1;
             }else if(in->zclip){
-                inside&=screen_lo>=(double)in->zmin+1e-3 && screen_hi<=(double)in->zmax-1e-3;
+                inside_z&=screen_lo>=(double)in->zmin+1e-3 && screen_hi<=(double)in->zmax-1e-3;
                 all_near&=screen_hi<(double)in->zmin-1;
                 all_far&=screen_lo>(double)in->zmax+1;
             }
@@ -358,15 +362,23 @@ static int gpu_raw_point_bounds(const NvRawMesh *m,const NvRawInput *in)
         if(!g.selftest)++raw.point_outside;
         return -1;
     }
-    if(inside){if(!g.selftest)++raw.point_inside;return 1;}
+    if(inside_xy && inside_z){if(!g.selftest)++raw.point_inside;return 1;}
+    *reason=inside_xy?RAW_Z:RAW_XY;
 uncertain:
     if(!g.selftest)++raw.point_unsafe;
     return 0;
 }
 static int gpu_raw_bounds(const NvRawMesh *m,const NvRawInput *in)
 {
-    int boxed=gpu_raw_box_bounds(m,in);
-    return boxed?boxed:gpu_raw_point_bounds(m,in);
+    unsigned reason;
+    int boxed=gpu_raw_box_bounds(m,in,&reason);
+    int result=boxed?boxed:gpu_raw_point_bounds(m,in,&reason);
+    if(!result && !g.selftest) {
+        nv2a_frame_profile_add(NV_FRAME_RAW_BOUNDS,1);
+        nv2a_frame_profile_add(NV_FRAME_RAW_BOUNDS_VERTICES,m->vertices);
+        nv2a_frame_profile_add(NV_FRAME_RAW_BOUNDARY+reason,1);
+    }
+    return result;
 }
 static int gpu_raw_resident(NvRawMesh *m)
 {
@@ -794,13 +806,14 @@ pixel_done:
         proof.params.right=proof.params.bottom=32;
         proof.stream[0]=(NvRawStream){(const uint8_t*)positions,sizeof positions,sizeof positions[0],2,4};
         NvRawMesh *candidate=gpu_raw_mesh(&proof);
-        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=1)ok=0;
+        unsigned reason;
+        if(!candidate || gpu_raw_box_bounds(candidate,&proof,&reason)!=0 || gpu_raw_bounds(candidate,&proof)!=1)ok=0;
         positions[2][0]=33;
         candidate=gpu_raw_mesh(&proof);
-        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=0)ok=0;
+        if(!candidate || gpu_raw_box_bounds(candidate,&proof,&reason)!=0 || gpu_raw_bounds(candidate,&proof)!=0)ok=0;
         positions[2][0]=4;proof_constants[96][3]=-20;
         candidate=gpu_raw_mesh(&proof);
-        if(!candidate || gpu_raw_box_bounds(candidate,&proof)!=0 || gpu_raw_bounds(candidate,&proof)!=-1)ok=0;
+        if(!candidate || gpu_raw_box_bounds(candidate,&proof,&reason)!=0 || gpu_raw_bounds(candidate,&proof)!=-1)ok=0;
     }
     gpu_raw_reset();g.active=g.resident=0;g.host_color=NULL;g.host_depth=NULL;g.target_written=0;g.pending_count=0;
     memset(&g.completed,0,sizeof g.completed);

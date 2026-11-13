@@ -1591,6 +1591,7 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    xbox_frame_trace_thread(XBOX_TRACE_FIFO);
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         xbox_Nv2aAckBusyBits();
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {

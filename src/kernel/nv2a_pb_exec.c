@@ -405,7 +405,7 @@ static struct {
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
-    uint32_t zeta_offset, zstencil_clear, control0;
+    uint32_t zeta_offset, zeta_pitch, zstencil_clear, control0;
     float clip_z_min, clip_z_max;
     uint32_t clip_z_seen, xf_zclip_partial, xf_zclip_outside;
 } s_gpu;
@@ -1676,6 +1676,24 @@ static float *zbuf_current(int create)
 {
     int i;
     size_t k;
+
+#ifdef XBOX_FRAME_TELEMETRY
+    /* Record the guest binding separately from the host float buffer identity.
+     * The buffer still follows the existing offset-based ownership rules. */
+    if (create && nv2a_frame_profile_enabled()) {
+        static uint32_t offset = UINT32_MAX, extent, format;
+        uint32_t current_extent = (s_gpu.clip_w & 0xFFFFu) | (s_gpu.clip_h << 16);
+        uint32_t layout = (s_gpu.format & 0x3FFFu) |
+            ((s_gpu.control0 & 0x1000u) << 3) | (s_gpu.zeta_pitch << 16);
+        if (offset != s_gpu.zeta_offset || extent != current_extent || format != layout) {
+            offset = s_gpu.zeta_offset;
+            extent = current_extent;
+            format = layout;
+            xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_DEPTH_LAYOUT,
+                                  nv2a_frame_profile_next_id(), offset, extent, format);
+        }
+    }
+#endif
 
     for (i = 0; i < 4; i++)
         if (s_zbufs[i].z && s_zbufs[i].offset == s_gpu.zeta_offset)
@@ -3780,6 +3798,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_SURFACE_PITCH:
         s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
+        s_gpu.zeta_pitch = param >> 16;
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
         if (s_ftrace == 2)
@@ -3974,8 +3993,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
-        /* And this is a completed swap, which is what a title's own swap
-         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+        /* Refresh the guest display clock and record a completed swap.
+         * The kernel interrupt counter is a separate, optional schedule. */
         xbox_Nv2aFrameCounterFlip();
         uint32_t frame_id = ++completed_frame_id;
 #ifdef XBOX_FRAME_TELEMETRY

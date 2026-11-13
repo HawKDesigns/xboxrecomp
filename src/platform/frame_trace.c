@@ -27,6 +27,8 @@ static volatile LONG s_state, s_guest_ticks;
 enum { TRACE_OFF, TRACE_RUNNING, TRACE_STOPPING };
 static uint64_t s_origin;
 static HANDLE s_writer;
+static volatile LONG s_thread_ids[XBOX_TRACE_THREAD_ROLES];
+static volatile uint32_t *s_main_pc;
 
 static LONG load(volatile LONG *value)
 {
@@ -47,6 +49,35 @@ void xbox_frame_trace_guest_ticks(uint32_t elapsed)
 uint32_t xbox_frame_trace_guest_tick_count(void)
 {
     return (uint32_t)load(&s_guest_ticks);
+}
+
+void xbox_frame_trace_thread(enum XboxTraceThread role)
+{
+    InterlockedExchange(&s_thread_ids[role], (LONG)GetCurrentThreadId());
+}
+
+void xbox_frame_trace_main_pc(volatile uint32_t *pc)
+{
+    s_main_pc = pc;
+}
+
+static void sample_threads(HANDLE *handles, DWORD *ids)
+{
+    for (unsigned role = 0; role < XBOX_TRACE_THREAD_ROLES; ++role) {
+        DWORD id = (DWORD)load(&s_thread_ids[role]);
+        if (id != ids[role]) {
+            if (handles[role]) CloseHandle(handles[role]);
+            handles[role] = id ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id) : NULL;
+            ids[role] = handles[role] ? id : 0;
+        }
+        FILETIME creation, exit, kernel, user;
+        if (!handles[role] || !GetThreadTimes(handles[role], &creation, &exit, &kernel, &user))
+            continue;
+        uint64_t total = (((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime) +
+                         (((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime);
+        xbox_frame_trace_note(XBOX_TRACE_TITLE, XBOX_TRACE_THREAD_CPU, role,
+                              (uint32_t)total, (uint32_t)(total >> 32), id);
+    }
 }
 
 void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent event,
@@ -77,12 +108,28 @@ void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent 
 static DWORD WINAPI trace_writer(LPVOID arg)
 {
     FILE *file = arg;
-    const uint32_t header[] = {0x52545051u, 2, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
+    const uint32_t header[] = {0x52545051u, 3, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
+    HANDLE handles[XBOX_TRACE_THREAD_ROLES] = {0};
+    DWORD ids[XBOX_TRACE_THREAD_ROLES] = {0};
+    uint64_t next_pc = 0, next_cpu = 0;
     if (fwrite(header, sizeof header, 1, file) != 1 || fflush(file))
         goto failed;
     for (;;) {
         int stopping = load(&s_state) == TRACE_STOPPING;
         int busy = 0, wrote = 0;
+        if (!stopping) {
+            uint64_t now = xbox_HostNowNs();
+            if (now >= next_cpu) {
+                sample_threads(handles, ids);
+                next_cpu = now + 1000000000ull;
+            }
+            if (s_main_pc && now >= next_pc) {
+                uint32_t pc = *s_main_pc;
+                xbox_frame_trace_note(XBOX_TRACE_TITLE, XBOX_TRACE_GUEST_PC, 0, pc,
+                                      (uint32_t)load(&s_thread_ids[XBOX_TRACE_GUEST_MAIN]), 0);
+                next_pc = now + 50000000ull;
+            }
+        }
         for (unsigned i = 0; i < XBOX_TRACE_PRODUCERS; ++i) {
             TraceRing *ring = &s_rings[i];
             if (stopping && load(&ring->writing))
@@ -110,10 +157,14 @@ static DWORD WINAPI trace_writer(LPVOID arg)
             i, 0, (uint32_t)load(&s_rings[i].dropped), 0, 0};
         if (fwrite(&footer, sizeof footer, 1, file) != 1) goto failed;
     }
+    for (unsigned i = 0; i < XBOX_TRACE_THREAD_ROLES; ++i)
+        if (handles[i]) CloseHandle(handles[i]);
     return fclose(file) ? 1 : 0;
 
 failed:
     InterlockedExchange(&s_state, TRACE_OFF);
+    for (unsigned i = 0; i < XBOX_TRACE_THREAD_ROLES; ++i)
+        if (handles[i]) CloseHandle(handles[i]);
     fclose(file);
     return 1;
 }

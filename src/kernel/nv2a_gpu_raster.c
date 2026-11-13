@@ -262,7 +262,9 @@ static int gpu_shade_probe_initialize(void);
 static void gpu_shade_probe_replay(unsigned token,unsigned simple,unsigned first,unsigned end,unsigned factor);
 static DWORD WINAPI gpu_prepare_thread(LPVOID unused)
 {
-    (void)unused;InterlockedExchange(&s_startup_thread,(LONG)GetCurrentThreadId());
+    (void)unused;
+    xbox_frame_trace_thread(XBOX_TRACE_GPU_STARTUP);
+    InterlockedExchange(&s_startup_thread,(LONG)GetCurrentThreadId());
     int ok=gpu_initialize();
     InterlockedExchange(&s_startup,ok?2:3);
     return 0;
@@ -684,6 +686,9 @@ enum {
 static int gpu_pending_dependency(unsigned origin,const GpuPendingReadback *p)
 {
     unsigned shape=gpu_target_shape(p->target.width,p->target.height);
+    unsigned flags=(p->publish_depth != 0) | ((p->surface_copy_pending != 0) << 1);
+    unsigned extent=(p->target.width & 0xFFFFu) | (p->target.height << 16);
+    unsigned pending=g.pending_count;
     double begin=gpu_ms();
     int result=gpu_pending_drain();
     if(!g.selftest) {
@@ -692,6 +697,10 @@ static int gpu_pending_dependency(unsigned origin,const GpuPendingReadback *p)
         g.dependency_source[origin][shape].wait_ms+=elapsed;
         nv2a_frame_profile_add(NV_FRAME_DEPENDENCY+origin*4+shape,elapsed);
         nv2a_frame_profile_add(NV_FRAME_TARGET_DRAIN_COUNT+origin,1);
+        if(origin==GPU_DEP_TARGET_DEPTH && nv2a_frame_profile_enabled())
+            xbox_frame_trace_note(XBOX_TRACE_RENDERER,XBOX_TRACE_DEPTH_DRAIN,
+                nv2a_frame_profile_next_id(),extent,flags | (pending << 8),
+                (uint32_t)(elapsed*1000.0));
     }
     return result;
 }
@@ -2280,6 +2289,10 @@ static int gpu_initialize(void)
                 char name[256]={0};WideCharToMultiByte(CP_UTF8,0,desc.Description,-1,name,sizeof name,NULL,NULL);
                 fprintf(stderr,"[GPU-RASTER] hardware adapter=%s feature_level=%04X dedicated_mib=%llu\n",
                     name,(unsigned)actual,(unsigned long long)(desc.DedicatedVideoMemory/(1024*1024)));
+#if defined(XBOX_FRAME_TELEMETRY)
+                fprintf(stderr,"[GPU-ADAPTER-ID] vendor=%04X device=%04X subsystem=%08X revision=%02X\n",
+                    (unsigned)desc.VendorId,(unsigned)desc.DeviceId,(unsigned)desc.SubSysId,(unsigned)desc.Revision);
+#endif
             }
             IDXGIAdapter_Release(adapter);
         }

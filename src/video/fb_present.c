@@ -40,6 +40,7 @@
 #include "keyboard.h"   /* src/input */
 #include "gpu_present.h"
 #include "platform/frame_trace.h"
+#include "platform/host_time.h"
 #include "recomp_exit_hook.h"   /* src/platform */
 #include <stdbool.h>
 #include "pvideo_scanout.h"
@@ -132,6 +133,15 @@ static void fb_overlay(void)
     if (!presented && s_pvideo_source)
         pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
                        s_fb_width, s_fb_height, s_pvideo_bank);
+    if (presented && xbox_frame_trace_enabled()) {
+        static DWORD last_activity;
+        DWORD now = GetTickCount();
+        if (!last_activity || now - last_activity >= 250) {
+            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_SCENE_ACTIVITY,
+                                  0, XBOX_PHASE_VIDEO, 0, 0);
+            last_activity = now;
+        }
+    }
 }
 
 /* Publish a resolved frame using the same lock as guest-memory flips. */
@@ -254,6 +264,96 @@ static int fb_copy_presented_frame(uint32_t *dst, uint32_t *frame_id)
 static wchar_t       s_title[48] = L"Xbox Recomp";
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
+#ifdef XBOX_FRAME_TELEMETRY
+#define FB_STATS_HISTORY 120
+static volatile LONG s_stats_open;
+static SRWLOCK s_stats_lock = SRWLOCK_INIT;
+static DWORD s_stats_frame_us[FB_STATS_HISTORY];
+static unsigned s_stats_next, s_stats_count;
+static HDC s_stats_canvas;
+static HBITMAP s_stats_bitmap;
+static HGDIOBJ s_stats_old_bitmap;
+static uint32_t *s_stats_pixels;
+
+static int compare_frame_us(const void *a, const void *b)
+{
+    DWORD left = *(const DWORD *)a, right = *(const DWORD *)b;
+    return (left > right) - (left < right);
+}
+
+/* Draw into the host's private frame copy so the same overlay works with
+ * both presenters, including borderless fullscreen. */
+static void fb_draw_stats(HDC target)
+{
+    enum { width = 308, height = 75, graph_y = 67 };
+    static DWORD updated;
+    if (s_fb_width < width + 16 || s_fb_height < height + 16) return;
+    if (!s_stats_canvas) {
+        BITMAPINFO info = {0};
+        void *bits = NULL;
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        s_stats_canvas = CreateCompatibleDC(target);
+        if (!s_stats_canvas) return;
+        s_stats_bitmap = CreateDIBSection(s_stats_canvas, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (!s_stats_bitmap) { DeleteDC(s_stats_canvas); s_stats_canvas = NULL; return; }
+        s_stats_pixels = bits;
+        s_stats_old_bitmap = SelectObject(s_stats_canvas, s_stats_bitmap);
+        SetBkMode(s_stats_canvas, TRANSPARENT);
+        SetTextColor(s_stats_canvas, RGB(234, 240, 246));
+        SelectObject(s_stats_canvas, GetStockObject(DEFAULT_GUI_FONT));
+        updated = 0;
+    }
+    DWORD now = GetTickCount();
+    if (!updated || now - updated >= 250) {
+        DWORD samples[FB_STATS_HISTORY];
+        unsigned count, first, slow = 0;
+        uint64_t total = 0;
+        AcquireSRWLockShared(&s_stats_lock);
+        count = s_stats_count;
+        first = (s_stats_next + FB_STATS_HISTORY - count) % FB_STATS_HISTORY;
+        for (unsigned i = 0; i < count; ++i)
+            samples[i] = s_stats_frame_us[(first + i) % FB_STATS_HISTORY];
+        ReleaseSRWLockShared(&s_stats_lock);
+        for (unsigned i = 0; i < width * height; ++i) s_stats_pixels[i] = 0x00101822;
+        for (unsigned i = 0; i < count; ++i) {
+            DWORD us = samples[i];
+            unsigned bar = us < 40000 ? (unsigned)us / 1000 : 40;
+            unsigned x = 12 + i * 2;
+            uint32_t color = us > 33333 ? 0x00E3A251 : 0x0067D6A8;
+            slow += us > 33333;
+            total += us;
+            for (unsigned y = graph_y - bar; y < graph_y; ++y)
+                s_stats_pixels[y * width + x] = s_stats_pixels[y * width + x + 1] = color;
+        }
+        qsort(samples, count, sizeof(*samples), compare_frame_us);
+        char label[120];
+        if (total)
+            snprintf(label, sizeof label, "%.1f FPS   P95 %.1f ms   %u/%u over 33 ms   %ld draws",
+                     count * 1000000.0 / total, samples[(count * 95 - 1) / 100] / 1000.0,
+                     slow, count, (long)s_frame_draws);
+        else
+            snprintf(label, sizeof label, "Waiting for completed flips");
+        TextOutA(s_stats_canvas, 10, 5, label, (int)strlen(label));
+        GdiFlush();
+        updated = now;
+    }
+    for (unsigned y = 0; y < height; ++y)
+        memcpy(s_rgb + (y + 8) * s_fb_width + 8, s_stats_pixels + y * width, width * sizeof(*s_stats_pixels));
+}
+
+static void fb_close_stats(void)
+{
+    if (!s_stats_canvas) return;
+    SelectObject(s_stats_canvas, s_stats_old_bitmap);
+    DeleteObject(s_stats_bitmap);
+    DeleteDC(s_stats_canvas);
+    s_stats_canvas = NULL;
+}
+#endif
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
@@ -268,6 +368,22 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
     InterlockedIncrement(&s_flips);
     InterlockedExchange(&s_frame_draws, (LONG)draws);
+#ifdef XBOX_FRAME_TELEMETRY
+    static uint64_t previous;
+    if (InterlockedCompareExchange(&s_stats_open, 0, 0)) {
+        uint64_t now = xbox_HostNowNs();
+        if (previous && TryAcquireSRWLockExclusive(&s_stats_lock)) {
+            uint64_t elapsed = (now - previous) / 1000;
+            s_stats_frame_us[s_stats_next] = elapsed < UINT32_MAX ? (DWORD)elapsed : UINT32_MAX;
+            s_stats_next = (s_stats_next + 1) % FB_STATS_HISTORY;
+            if (s_stats_count < FB_STATS_HISTORY) ++s_stats_count;
+            ReleaseSRWLockExclusive(&s_stats_lock);
+        }
+        previous = now;
+    } else {
+        previous = 0;
+    }
+#endif
 }
 
 /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
@@ -310,6 +426,22 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     if (m == WM_SYSKEYDOWN && w == VK_RETURN)
         return 0;                       /* auto-repeat of Alt+Enter */
+#ifdef XBOX_FRAME_TELEMETRY
+    if ((m == WM_KEYDOWN || m == WM_KEYUP) && w == VK_F2) {
+        if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
+            LONG open = InterlockedCompareExchange(&s_stats_open, 0, 0);
+            if (!open) {
+                AcquireSRWLockExclusive(&s_stats_lock);
+                s_stats_count = s_stats_next = 0;
+                ReleaseSRWLockExclusive(&s_stats_lock);
+            }
+            InterlockedExchange(&s_stats_open, !open);
+            fb_close_stats();
+            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_OVERLAY, 0, !open, 0, 0);
+        }
+        return 0;
+    }
+#endif
     if ((m == WM_KEYDOWN || m == WM_KEYUP) && w == VK_F3 && xbox_frame_trace_enabled()) {
         static int paused;
         if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
@@ -541,6 +673,9 @@ static int gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
  * for vsync, so returns 1 when the loop is already paced), else GDI. */
 static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, int *shown)
 {
+#ifdef XBOX_FRAME_TELEMETRY
+    if (InterlockedCompareExchange(&s_stats_open, 0, 0)) fb_draw_stats(hdc);
+#endif
     if (gpu_present_active())
         return gpu_present_frame(s_rgb, shown);
     *shown = gdi_blit(hwnd, hdc, bi);
@@ -557,6 +692,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     uint32_t last_drawn = 0;
 
     (void)unused;
+    xbox_frame_trace_thread(XBOX_TRACE_PRESENTER);
 
     {
         WNDCLASSA wc;
@@ -693,6 +829,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             Sleep(16);                  /* D3D11's Present waited for vsync */
     }
 
+#ifdef XBOX_FRAME_TELEMETRY
+    InterlockedExchange(&s_stats_open, 0);
+    fb_close_stats();
+#endif
     gpu_present_shutdown();
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);

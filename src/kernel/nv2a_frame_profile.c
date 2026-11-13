@@ -47,7 +47,8 @@ void nv2a_frame_profile_flip(uint32_t frame, uint32_t draws, double now)
     s_metric[NV_FRAME_DRAW_REQUESTS] = draws;
     s_last_frame = frame;
     for (unsigned i = 0; i < NV_FRAME_METRICS; ++i) {
-        int is_count = i >= NV_FRAME_BATCHES && i < NV_FRAME_DEPENDENCY && i != NV_FRAME_FIFO_DRAW_MS;
+        int is_count = (i >= NV_FRAME_BATCHES && i < NV_FRAME_DEPENDENCY &&
+                        i != NV_FRAME_FIFO_DRAW_MS) || i >= NV_FRAME_RAW_BOUNDARY;
         double value = s_metric[i] * (is_count ? 1.0 : 1000.0);
         s_metric[i] = 0;
         if (value >= 1.0)
