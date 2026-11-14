@@ -1141,10 +1141,9 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 /* ---- Video standard, the second byte of the AVPACK query result ----
  *
  * AvSendTVEncoderOption(AV_OPTION_QUERY_AVPACK) does not return the pack type
- * alone: D3D reads the same word for the pack (0x000000FF), the video standard
- * (0x0000FF00) and the refresh rate (0x00C00000), and its mode table is keyed
- * on all three. Returning a bare pack byte leaves the standard as 0, which
- * matches no row in that table and fails device creation. */
+ * alone: D3D reads the pack (0x000000FF), the video standard (0x0000FF00),
+ * the dashboard widescreen preference (0x00010000) and the refresh rate
+ * (0x00C00000) from that word for mode selection and admission. */
 #define AV_STANDARD_NTSC_M      0x01
 #define AV_STANDARD_NTSC_J      0x02
 #define AV_STANDARD_PAL_I       0x03

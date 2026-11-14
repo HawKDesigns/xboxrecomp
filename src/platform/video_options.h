@@ -4,12 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Select the output rectangle. Console video flags are independent because
- * some lifted titles cannot initialize their widescreen display mode. */
+/* The dashboard preference and host output must agree for anamorphic Xbox
+ * modes. Keep the old guest-only switch as an alias for manual launches. */
 static inline int xbox_video_widescreen(void)
 {
     const char *value = getenv("RECOMP_VIDEO_ASPECT");
-    return value && strcmp(value, "16:9") == 0;
+    if (value && strcmp(value, "16:9") == 0)
+        return 1;
+    if (value && strcmp(value, "4:3") == 0)
+        return 0;
+    const char *legacy = getenv("RECOMP_GUEST_WIDESCREEN");
+    return legacy && strcmp(legacy, "1") == 0;
 }
 
 #endif

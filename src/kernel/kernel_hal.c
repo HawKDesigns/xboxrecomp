@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "platform/host_time.h"
+#include "platform/video_options.h"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -1471,11 +1472,13 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * creation failed with E_FAIL.
          *
          * HDTV pack keeps 480p/720p available to titles that offer them;
-         * NTSC-M and 60Hz are the North American retail default, and match
-         * the region reported by ExQueryNonVolatileSetting. */
+         * NTSC-M and 60Hz are the North American retail default. In addition
+         * to choosing a widescreen row, the Xbox D3D mode selector checks
+         * the dashboard widescreen bit in this word before admitting it. */
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
-                | AV_REFRESH_60Hz;
+                | AV_REFRESH_60Hz
+                | (xbox_video_widescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0);
         break;
 
     case AV_OPTION_QUERY_MODE:

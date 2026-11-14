@@ -124,8 +124,8 @@ The executor is itself opt-in: set `RECOMP_PB_EXEC=1` to execute the pushbuffer.
 | `RECOMP_FB_WINDOW_DUMP_EVERY=N` | 0 | With `RECOMP_FB_DUMP`: dumps what the window shows every N frames. | `fb_present.c` |
 | `RECOMP_WINDOW_SCALE=1..8` | 2 | Client-area scale. | `fb_present.c`, `fb_present_sdl.c` |
 | `RECOMP_FULLSCREEN` | off | Starts fullscreen (Win32 and SDL presenters). | `fb_present.c`, `fb_present_sdl.c` |
-| `RECOMP_VIDEO_ASPECT` | original | `16:9` presents the frame in a 16:9 area. | `present_layout.h` |
-| `RECOMP_GUEST_WIDESCREEN` | off | `1` sets the guest EEPROM widescreen preference for title development. QPR2's guest widescreen initialization currently fails. | `kernel_xbox.c` |
+| `RECOMP_VIDEO_ASPECT` | `4:3` | `16:9` enables the Xbox widescreen preference in the EEPROM and AV-pack query, and displays the game's anamorphic frame in a 16:9 area. | `video_options.h`, `kernel_xbox.c`, `kernel_hal.c` |
+| `RECOMP_GUEST_WIDESCREEN` | off | Legacy alias for `RECOMP_VIDEO_ASPECT=16:9` when no aspect is explicitly selected. | `video_options.h` |
 | `RECOMP_RENDER_SCALE` | 1 | `2` or `3` draws eligible 640×480 scanout targets at 1280×960 or 1920×1440 on the Windows native ROV backend. Guest reads and visibility retain the original pixel grid. | `nv2a_gpu_raster.c` |
 | `RECOMP_HEADLESS` | off | No window and a dummy audio driver. | `fb_present_sdl.c`, `apu_sdl2.c` |
 | `RECOMP_CLOSE_KEEPS_RUNNING=1` | off | Closing the window only closes it instead of exiting the process. | `fb_present.c` |
