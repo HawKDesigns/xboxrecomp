@@ -182,6 +182,11 @@ static struct {
         uint64_t waits,reused,avoided_pixels,access_drains;
         uint64_t feedback_snapshots,feedback_fallbacks;
         double wait_ms;
+        /* RECOMP_GPU_COMPLETION_ASYNC experiment, off by default: see
+         * nv_gpu_sync_completion. */
+        int async_enabled;
+        unsigned async_limit,async_run;
+        uint64_t async_releases,async_forced;
     } completion;
     struct {
         int enabled;
@@ -1039,7 +1044,7 @@ int nv_gpu_sync_completion(NvGpuCount *count)
        !g.native || g.native_diagnostics || g.selftest || s_capture || g.auto_enabled)return 0;
     if(g.readback_failed)return -1;
     if(!gpu_flush()){g.readback_failed=1;return -1;}
-    if(g.completion.reuse_enabled && g.completion.confirmed) {
+    if(!g.completion.async_enabled && g.completion.reuse_enabled && g.completion.confirmed) {
         if(FAILED(ID3D11Device_GetDeviceRemovedReason(g.device))) {
             g.readback_failed=1;
             return -1;
@@ -1057,6 +1062,26 @@ int nv_gpu_sync_completion(NvGpuCount *count)
     }
     if(!gpu_staging_buffer(&g.completion.staging,&g.completion.staging_bytes,4)){
         g.completion.enabled=0;return 0;
+    }
+    /* Opt-in comparison only. Submission can precede GPU completion;
+     * later readbacks still enforce GPU order. Bound early notifications
+     * with a blocking marker and never release on a known device failure. */
+    if(g.completion.async_enabled && g.completion.async_run<g.completion.async_limit){
+        ID3D11DeviceContext_Flush(g.context);
+        if(FAILED(ID3D11Device_GetDeviceRemovedReason(g.device))) {
+            g.readback_failed=1;
+            return -1;
+        }
+        ++g.completion.async_run;++g.completion.async_releases;
+        nv2a_frame_profile_add(NV_FRAME_COMPLETION_EARLY_RELEASES,1);
+        if(g.active){g.completion.unpublished=1;
+            g.completion.avoided_pixels+=(uint64_t)g.target.width*g.target.height;}
+        return 1;
+    }
+    if(g.completion.async_enabled){
+        g.completion.async_run=0;
+        ++g.completion.async_forced;
+        nv2a_frame_profile_add(NV_FRAME_COMPLETION_FORCED_MARKERS,1);
     }
     uint32_t serial=++g.completion.serial;
     nv2a_frame_profile_add(NV_FRAME_COMPLETION_MARKERS,1);
@@ -2348,6 +2373,9 @@ static int gpu_initialize(void)
     g.native_diagnostics=diagnostics && atoi(diagnostics)>0;
     {const char *e=getenv("RECOMP_GPU_COMPLETION_TOKEN");g.completion.enabled=e && atoi(e)>0;}
     {const char *e=getenv("RECOMP_GPU_COMPLETION_REUSE");g.completion.reuse_enabled=e && atoi(e)>0;}
+    {const char *e=getenv("RECOMP_GPU_COMPLETION_ASYNC");g.completion.async_enabled=e && atoi(e)>0;
+     const char *n=getenv("RECOMP_GPU_COMPLETION_ASYNC_MAX");int limit=n?atoi(n):32;
+     g.completion.async_limit=(unsigned)(limit<1?1:limit>4096?4096:limit);}
     {const char *e=getenv("RECOMP_GPU_FEEDBACK_SNAPSHOT");g.completion.feedback_enabled=!e || atoi(e)>0;}
     const char *local_rov=getenv("RECOMP_GPU_LOCAL_ROV");
     g.local_rov=local_rov && atoi(local_rov)>0;
@@ -3321,6 +3349,15 @@ void nv_gpu_report(void)
         fprintf(stderr,"[GPU-COMPLETION-REUSE] reused=%llu\n",(unsigned long long)g.completion.reused);
     g.completion.reused=0;
     g.completion.feedback_snapshots=g.completion.feedback_fallbacks=0;g.completion.wait_ms=0;
+    /* Printed only when requested, like [GPU-SURFACE-ROTATION], so a baseline
+     * log is unchanged and the line's presence proves the setting reached
+     * the runtime. */
+    if(g.completion.async_enabled)
+        fprintf(stderr,"[GPU-COMPLETION-ASYNC] enabled=%u releases=%llu forced_waits=%llu limit=%u\n",
+            (unsigned)(g.completion.enabled && g.completion.async_enabled),
+            (unsigned long long)g.completion.async_releases,(unsigned long long)g.completion.async_forced,
+            g.completion.async_limit);
+    g.completion.async_releases=g.completion.async_forced=0;
     for(unsigned shape=0;shape<4;shape++){
         const char *name=shape==0?"640x480":shape==1?"256x256":shape==2?"128x128":"other";
         fprintf(stderr,"[GPU-TARGET-SHAPE] size=%s binds=%llu queued=%llu readbacks=%llu pixels=%llu map_wait_ms=%.3f empty_skips=%llu\n",

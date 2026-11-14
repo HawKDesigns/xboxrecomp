@@ -1,6 +1,13 @@
 /* Fixed-size producer rings. Producers publish records without allocating,
  * formatting, waiting, or touching the stream. Only the writer owns the file. */
+#if defined(_WIN32) || defined(XBOX_FRAME_TRACE_WIN32_SHIM)
+#define TRACE_WINDOWS 1
 #include <windows.h>
+#else
+/* POSIX hosts: the platform layer supplies the same Interlocked, thread and
+ * sleep primitives (win32_compat.c), so the recorder below is one source. */
+#include "win32_compat.h"
+#endif
 #include <stdio.h>
 #include "frame_trace.h"
 #include "host_time.h"
@@ -23,7 +30,7 @@ typedef struct {
 } TraceRing;
 
 static TraceRing s_rings[XBOX_TRACE_PRODUCERS];
-static volatile LONG s_state, s_guest_ticks;
+static volatile LONG s_state, s_guest_ticks, s_vblank_events;
 enum { TRACE_OFF, TRACE_RUNNING, TRACE_STOPPING };
 static uint64_t s_origin;
 static HANDLE s_writer;
@@ -61,6 +68,7 @@ void xbox_frame_trace_main_pc(volatile uint32_t *pc)
     s_main_pc = pc;
 }
 
+#if defined(TRACE_WINDOWS)
 static void sample_threads(HANDLE *handles, DWORD *ids)
 {
     for (unsigned role = 0; role < XBOX_TRACE_THREAD_ROLES; ++role) {
@@ -78,6 +86,19 @@ static void sample_threads(HANDLE *handles, DWORD *ids)
         xbox_frame_trace_note(XBOX_TRACE_TITLE, XBOX_TRACE_THREAD_CPU, role,
                               (uint32_t)total, (uint32_t)(total >> 32), id);
     }
+}
+
+#endif
+
+void xbox_frame_trace_vblank_event(void)
+{
+    if (xbox_frame_trace_enabled())
+        InterlockedIncrement(&s_vblank_events);
+}
+
+uint32_t xbox_frame_trace_vblank_event_count(void)
+{
+    return (uint32_t)load(&s_vblank_events);
 }
 
 void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent event,
@@ -108,10 +129,13 @@ void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent 
 static DWORD WINAPI trace_writer(LPVOID arg)
 {
     FILE *file = arg;
-    const uint32_t header[] = {0x52545051u, 3, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
+    const uint32_t header[] = {0x52545051u, 4, sizeof(TraceRecord), XBOX_TRACE_PRODUCERS};
+#if defined(TRACE_WINDOWS)
     HANDLE handles[XBOX_TRACE_THREAD_ROLES] = {0};
     DWORD ids[XBOX_TRACE_THREAD_ROLES] = {0};
-    uint64_t next_pc = 0, next_cpu = 0;
+    uint64_t next_cpu = 0;
+#endif
+    uint64_t next_pc = 0;
     if (fwrite(header, sizeof header, 1, file) != 1 || fflush(file))
         goto failed;
     for (;;) {
@@ -119,10 +143,12 @@ static DWORD WINAPI trace_writer(LPVOID arg)
         int busy = 0, wrote = 0;
         if (!stopping) {
             uint64_t now = xbox_HostNowNs();
+#if defined(TRACE_WINDOWS)
             if (now >= next_cpu) {
                 sample_threads(handles, ids);
                 next_cpu = now + 1000000000ull;
             }
+#endif
             if (s_main_pc && now >= next_pc) {
                 uint32_t pc = *s_main_pc;
                 xbox_frame_trace_note(XBOX_TRACE_TITLE, XBOX_TRACE_GUEST_PC, 0, pc,
@@ -157,23 +183,24 @@ static DWORD WINAPI trace_writer(LPVOID arg)
             i, 0, (uint32_t)load(&s_rings[i].dropped), 0, 0};
         if (fwrite(&footer, sizeof footer, 1, file) != 1) goto failed;
     }
+#if defined(TRACE_WINDOWS)
     for (unsigned i = 0; i < XBOX_TRACE_THREAD_ROLES; ++i)
         if (handles[i]) CloseHandle(handles[i]);
+#endif
     return fclose(file) ? 1 : 0;
 
 failed:
     InterlockedExchange(&s_state, TRACE_OFF);
+#if defined(TRACE_WINDOWS)
     for (unsigned i = 0; i < XBOX_TRACE_THREAD_ROLES; ++i)
         if (handles[i]) CloseHandle(handles[i]);
+#endif
     fclose(file);
     return 1;
 }
 
-int xbox_frame_trace_start(const wchar_t *path)
+static int trace_start_file(FILE *file)
 {
-    if (!path || !*path || s_writer || load(&s_state))
-        return 0;
-    FILE *file = _wfopen(path, L"wb");
     if (!file) return 0;
     s_origin = xbox_HostNowNs();
     InterlockedExchange(&s_state, TRACE_RUNNING);
@@ -184,6 +211,22 @@ int xbox_frame_trace_start(const wchar_t *path)
         return 0;
     }
     return 1;
+}
+
+#if defined(_WIN32) || defined(XBOX_FRAME_TRACE_WIN32_SHIM)
+int xbox_frame_trace_start(const wchar_t *path)
+{
+    if (!path || !*path || s_writer || load(&s_state))
+        return 0;
+    return trace_start_file(_wfopen(path, L"wb"));
+}
+#endif
+
+int xbox_frame_trace_start_utf8(const char *path)
+{
+    if (!path || !*path || s_writer || load(&s_state))
+        return 0;
+    return trace_start_file(fopen(path, "wb"));
 }
 
 void xbox_frame_trace_stop(void)

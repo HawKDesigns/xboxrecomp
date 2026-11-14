@@ -21,6 +21,7 @@
 #include "kernel_missing.h"
 #include "main_pc_samples.h"
 #include "platform/frame_trace.h"
+#include "platform/thread_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -747,7 +748,11 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32)
+    /* Every POSIX host that reaches here has a store decoder (arm64, and
+     * x86-64 Linux): xbox_Ac97PosixFault services the trapped write. The
+     * guard used to name arm64 alone, which sent x86-64 Linux down the Win32
+     * VEH path below, where the trap could never arm. */
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -1412,6 +1417,7 @@ static void frame_counters_tick(void)
             uint32_t event=dev+g_frame_counters[i].event_off;
             if(fence_readable(event,16) && xbox_KeSignalGuestEvent(event)) {
                 uint64_t n=++g_frame_counters[i].event_signals;
+                xbox_frame_trace_vblank_event();
                 if(n<=4 || !(n&(n-1)))fprintf(stderr,
                     "[VBLANK-EVENT] signaled event=%08X ticks=%llu count=%llu\n",
                     event,(unsigned long long)elapsed_frames,(unsigned long long)n);
@@ -1592,6 +1598,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     xbox_frame_trace_thread(XBOX_TRACE_FIFO);
+    /* This thread runs the pushbuffer scan and executor. */
+    xbox_ThreadCpuRegister("fifo-executor");
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         xbox_Nv2aAckBusyBits();
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {

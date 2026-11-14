@@ -31,6 +31,7 @@
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 #include "platform/frame_trace.h"
+#include "platform/thread_cpu.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -771,6 +772,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+
+    xbox_ThreadCpuRegister("guest-thread");
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
@@ -3862,6 +3865,8 @@ static void kernel_timer_loop_ns(void)
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
+
+    xbox_ThreadCpuRegister("kernel-timer");
 
     (void)unused;
     if (slot < 0) {

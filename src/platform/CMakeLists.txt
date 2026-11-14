@@ -30,11 +30,18 @@ target_include_directories(recomp_exit_hook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # host_time: the host's monotonic clock and the timer thread's sleep
 # (host_time.h). A real library on every host, carried by platform to every
 # library of the runtime.
-add_library(host_time STATIC host_time.c)
+# thread_cpu.c rides along: per-thread CPU time for the periodic report
+# (thread_cpu.h), built on the same clock.
+add_library(host_time STATIC host_time.c thread_cpu.c)
 target_include_directories(host_time PUBLIC
     ${XBOXRECOMP_SRC_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(host_time PUBLIC XBOX_THREAD_CPU=1)
+if(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(host_time PUBLIC Threads::Threads)
+endif()
 
 if(WIN32)
     add_library(xbox_frame_trace STATIC frame_trace.c)
@@ -48,7 +55,10 @@ if(WIN32)
     target_include_directories(platform INTERFACE ${XBOXRECOMP_SRC_DIR})
     target_link_libraries(platform INTERFACE recomp_exit_hook)
 else()
-    add_library(platform STATIC win32_compat.c)
+    # frame_trace.c rides in the platform library here: it is built on the
+    # Win32-style primitives win32_compat.c implements.
+    add_library(platform STATIC win32_compat.c frame_trace.c)
+    target_compile_definitions(platform PUBLIC XBOX_FRAME_TELEMETRY=1)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

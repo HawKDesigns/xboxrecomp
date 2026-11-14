@@ -36,3 +36,25 @@ fallbacks. See the QPR2 project's [shader preparation guide](https://github.com/
 
 The Windows retail boot sequence, ROV activation and race performance need
 hardware validation against the tested v126 reference.
+
+## Changes after the first Windows baseline
+
+- **Linux x86-64.** The QPR2 title links against this runtime on Linux with
+  the software NV2A raster. `platform/frame_trace.c` builds on POSIX hosts as
+  part of the platform library, and the SDL window accepts the executor's
+  resolved frames, records handoff and draw events and takes F4–F7 phase
+  marks. The AC'97 bus-master write trap now arms on x86-64 Linux; the guard
+  had named arm64 only. See the QPR2 project's `docs/LINUX.md` for what has
+  and has not been run.
+- **`[THREAD-CPU]`.** `platform/thread_cpu.c` reports CPU time per named
+  thread in each periodic report, plus a process total. Use
+  `[GPU-FIFO] execute_ms` for executor occupancy, including waits.
+- **Delivered vblank notifications.** Trace version 4 records delivered
+  display event signals alongside the display tick and kernel interrupt
+  counters. The guest's clocks are unchanged.
+- **`RECOMP_GPU_COMPLETION_ASYNC`** (default off) releases completion-only
+  fences without the blocking marker Map, with a blocking marker every
+  `RECOMP_GPU_COMPLETION_ASYNC_MAX` (32) releases. It is exercised by the
+  QPR2 completion-token fixture against a D3D11 shim and has not run on
+  hardware.
+- **Renderer revision 1702.** The title and runtime must be updated together.

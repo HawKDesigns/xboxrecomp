@@ -46,6 +46,8 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "platform/frame_trace.h"
+#include "platform/thread_cpu.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "xinput_xbox.h"
 
@@ -60,6 +62,7 @@ struct fb_slot {
     uint8_t *px;
     size_t   cap;
     uint32_t bpp;
+    uint32_t frame_id;   /* completed-flip id for the frame trace; 0 = none */
 };
 
 /* What the window takes from SDL, and gives back on every way out. */
@@ -103,15 +106,18 @@ void xbox_FramebufferWindowStart(void) {}
 
 /* The back slot is filled: make it the ready one. An unshown ready frame is
  * overwritten (dropped), never waited for. */
-static void publish(uint32_t bpp)
+static void publish(uint32_t bpp, uint32_t frame_id)
 {
     s_slot[s_back].bpp = bpp;          /* only this thread touches s_back */
+    s_slot[s_back].frame_id = frame_id;
     pthread_mutex_lock(&s_lock);
     {
         int t = s_ready;
         s_ready = s_back;
         s_back = t;
         s_ready_seq++;
+        if (frame_id)
+            xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_HANDOFF, frame_id, 0, 0, 0);
     }
     pthread_mutex_unlock(&s_lock);
 
@@ -148,7 +154,36 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
     for (y = 0; y < FB_H; y++)
         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
                (size_t)FB_W * bpp);
-    publish(bpp);
+    publish(bpp, 0);
+}
+
+/* A resolved X8R8G8B8 frame from the executor's flip, with its completed-flip
+ * id: the POSIX half of the Win32 window's entry point of the same name. The
+ * handoff is recorded for the frame trace exactly where the Win32 window
+ * records it, after the frame is published. */
+void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
+                                        uint32_t width, uint32_t height, uint32_t frame_id)
+{
+    if (!__atomic_load_n(&s_running, __ATOMIC_SEQ_CST) || !pixels
+            || width != FB_W || height != FB_H)
+        return;
+    __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST)) {
+        struct fb_slot *s = &s_slot[s_back];
+        size_t need = (size_t)FB_W * FB_H * 4u;
+        if (s->cap < need) {
+            uint8_t *n = (uint8_t *)realloc(s->px, need);
+            if (n) {
+                s->px = n;
+                s->cap = need;
+            }
+        }
+        if (s->cap >= need) {
+            memcpy(s->px, pixels, need);
+            publish(4, frame_id);
+        }
+    }
+    __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -276,6 +311,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     SDL_Texture *tex = NULL;
     uint32_t tex_bpp = 0;
     uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
+    uint32_t pending_draw_id = 0, last_drawn_id = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
 
@@ -337,6 +373,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
     s_frame_event = s_guest_done_event + 1;
     s_guest_main = guest_main;
+    xbox_ThreadCpuRegister("presenter");
+    xbox_frame_trace_thread(XBOX_TRACE_PRESENTER);
     /* This thread pumps SDL events from here on, which also updates the
      * game controllers; the input layer then only reads them. */
     xbox_InputSetMainPump(1);
@@ -363,6 +401,27 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * the loop. */
         if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
             do {
+                if ((ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) && xbox_frame_trace_enabled()) {
+                    SDL_Keycode key = ev.key.keysym.sym;
+                    enum XboxTracePhase phase = 0;
+                    static int paused;
+                    if (key >= SDLK_F4 && key <= SDLK_F7) {
+                        static const enum XboxTracePhase phases[] = {
+                            XBOX_PHASE_UNMARKED, XBOX_PHASE_COUNTDOWN,
+                            XBOX_PHASE_AHEAD, XBOX_PHASE_BEHIND};
+                        phase = phases[key - SDLK_F4];
+                    } else if (key == SDLK_F1) phase = XBOX_PHASE_RIDER_MENU;
+                    else if (key == SDLK_F10) phase = XBOX_PHASE_ATV_MENU;
+                    if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
+                        if (phase)
+                            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_PHASE, 0, phase, 1, 0);
+                        else if (key == SDLK_F3) {
+                            paused = !paused;
+                            xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_PAUSE, 0, paused, 0, 0);
+                        }
+                    }
+                    if (phase || key == SDLK_F3) continue;
+                }
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
                 xbox_InputSdlEvent(&ev);
@@ -392,6 +451,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             shown_seq = seq;
             px = s_slot[s_front].px;
             bpp = s_slot[s_front].bpp;
+            pending_draw_id = s_slot[s_front].frame_id;
             pitch = FB_W * bpp;
         } else if (!shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
@@ -410,17 +470,21 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                                         (int)FB_W, (int)FB_H);
                 tex_bpp = bpp;
             }
-            if (tex)
-                SDL_UpdateTexture(tex, NULL, px, (int)pitch);
+            if (!tex || SDL_UpdateTexture(tex, NULL, px, (int)pitch) != 0)
+                pending_draw_id = 0;
             dirty = 1;
         }
         if (dirty) {
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            if (tex)
-                SDL_RenderCopy(ren, tex, NULL, NULL);
+            int drawn = tex && SDL_RenderCopy(ren, tex, NULL, NULL) == 0;
             SDL_RenderPresent(ren);
+            /* One draw record per distinct frame the host actually showed. */
+            if (drawn && pending_draw_id && pending_draw_id != last_drawn_id) {
+                last_drawn_id = pending_draw_id;
+                xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_DRAW, pending_draw_id, 0, 0, 0);
+            }
         }
 
         now = now_ms();

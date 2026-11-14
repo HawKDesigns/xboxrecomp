@@ -41,6 +41,7 @@
 #include "gpu_present.h"
 #include "platform/frame_trace.h"
 #include "platform/host_time.h"
+#include "platform/thread_cpu.h"
 #include "recomp_exit_hook.h"   /* src/platform */
 #include <stdbool.h>
 #include "pvideo_scanout.h"
@@ -686,6 +687,7 @@ static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, int *shown)
 
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
+    xbox_ThreadCpuRegister("presenter");
     HWND hwnd;
     HDC hdc;
     BITMAPINFO bi;

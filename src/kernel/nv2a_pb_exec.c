@@ -35,6 +35,7 @@
 #include "nv2a_frame_pacing.h"
 #include "platform/frame_trace.h"
 #include "nv2a_frame_profile.h"
+#include "platform/thread_cpu.h"
 static NvFramePacing s_frame_pacing;
 unsigned nv2a_pb_exec_overlay_revision(void) { return QPR2_RENDERER_REVISION; }
 #if defined(_WIN32)
@@ -2137,6 +2138,7 @@ static struct {
 static DWORD WINAPI raster_worker(LPVOID arg)
 {
     int k = (int)(intptr_t)arg;
+    xbox_ThreadCpuRegister("raster-worker");
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
         XfCount mine={0};
@@ -3999,9 +4001,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         xbox_Nv2aFrameCounterFlip();
         uint32_t frame_id = ++completed_frame_id;
 #ifdef XBOX_FRAME_TELEMETRY
-        if (xbox_frame_trace_enabled())
+        if (xbox_frame_trace_enabled()) {
             xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_FLIP, frame_id,
                 xbox_frame_trace_guest_tick_count(), xbox_VblankCount(), s_gpu.flips);
+            xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_VBLANK_EVENTS, frame_id,
+                xbox_frame_trace_vblank_event_count(), 0, 0);
+        }
 #endif
         /* Hand the window a copy of the frame just finished.
          *
@@ -4338,6 +4343,9 @@ void nv2a_pb_exec_report(void)
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
     nv_gpu_report();
 #endif
+    /* Which thread is saturated: CPU time per named thread since the last
+     * report, and the process total (see platform/thread_cpu.h). */
+    xbox_ThreadCpuReport(stderr);
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {

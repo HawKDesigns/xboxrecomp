@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/thread_cpu.h"
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -41,7 +42,9 @@ static DWORD WINAPI xbox_thread_wrapper(LPVOID lpParameter)
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u starting at %p",
         GetCurrentThreadId(), info.StartRoutine);
 
+    xbox_ThreadCpuRegister("guest-thread");
     info.StartRoutine(info.StartContext);
+    xbox_ThreadCpuUnregister();
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_THREAD, "Thread %u returned normally",
         GetCurrentThreadId());

@@ -28,7 +28,8 @@ enum XboxTraceEvent {
     XBOX_TRACE_DEPTH_LAYOUT,
     XBOX_TRACE_DEPTH_DRAIN,
     XBOX_TRACE_SCENE_ACTIVITY,
-    XBOX_TRACE_OVERLAY
+    XBOX_TRACE_OVERLAY,
+    XBOX_TRACE_VBLANK_EVENTS
 };
 
 enum XboxTraceThread {
@@ -52,7 +53,11 @@ enum XboxTracePhase {
 };
 
 #if defined(XBOX_FRAME_TELEMETRY)
+#if defined(_WIN32) || defined(XBOX_FRAME_TRACE_WIN32_SHIM)
 int xbox_frame_trace_start(const wchar_t *path);
+#endif
+/* The same recorder with a narrow path, for hosts without _wfopen. */
+int xbox_frame_trace_start_utf8(const char *path);
 void xbox_frame_trace_stop(void);
 int xbox_frame_trace_enabled(void);
 void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent event,
@@ -62,7 +67,14 @@ uint32_t xbox_frame_trace_guest_tick_count(void);
 void xbox_frame_trace_thread(enum XboxTraceThread role);
 /* Pointer to guest-main TLS, valid for the life of the title. */
 void xbox_frame_trace_main_pc(volatile uint32_t *pc);
+/* Vblank notifications the display clock delivered to the guest (one KEVENT
+ * signal per poll that crossed a display period). Telemetry only: this is
+ * not xbox_VblankCount, which guest-visible port reads depend on. */
+void xbox_frame_trace_vblank_event(void);
+uint32_t xbox_frame_trace_vblank_event_count(void);
 #else
+static inline int xbox_frame_trace_start_utf8(const char *path) { (void)path; return 0; }
+static inline void xbox_frame_trace_stop(void) {}
 static inline int xbox_frame_trace_enabled(void) { return 0; }
 static inline void xbox_frame_trace_note(enum XboxTraceProducer producer, enum XboxTraceEvent event,
                                          uint32_t frame, uint32_t arg0, uint32_t arg1, uint32_t arg2)
@@ -72,6 +84,8 @@ static inline void xbox_frame_trace_note(enum XboxTraceProducer producer, enum X
 static inline void xbox_frame_trace_guest_ticks(uint32_t elapsed) { (void)elapsed; }
 static inline uint32_t xbox_frame_trace_guest_tick_count(void) { return 0; }
 static inline void xbox_frame_trace_thread(enum XboxTraceThread role) { (void)role; }
+static inline void xbox_frame_trace_vblank_event(void) {}
+static inline uint32_t xbox_frame_trace_vblank_event_count(void) { return 0; }
 #endif
 
 #endif
