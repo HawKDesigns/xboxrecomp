@@ -874,6 +874,7 @@ static void clear_surface(uint32_t param)
          * so a triangle drawn a single time is erased before anyone sees it. */
         if (s_gpu.clip_w && s_gpu.clip_h) {
             float a[2], b[2], c[2];
+            gpu_finish();
             a[0] = s_gpu.clip_w * 0.5f; a[1] = s_gpu.clip_h * 0.15f;
             b[0] = s_gpu.clip_w * 0.85f; b[1] = s_gpu.clip_h * 0.85f;
             c[0] = s_gpu.clip_w * 0.15f; c[1] = s_gpu.clip_h * 0.85f;
@@ -1273,14 +1274,32 @@ static int surface_begin_batch(const uint8_t *mem)
 }
 
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+static NvGpuScaledCpuDraw s_scaled_cpu;
+
 static void scaled_cpu_draw(float *depth)
 {
-    size_t rows=s_gpu.clip_y+s_gpu.clip_h;
-    nv_gpu_scaled_cpu_write(s_surface,((s_gpu.format>>8)&15)==2?
-        (size_t)(1u<<((s_gpu.format>>16)&15))*(1u<<((s_gpu.format>>24)&15))*surface_bpp():
-        rows*s_gpu.pitch);
-    if(depth && s_gpu.depth_mask)
-        nv_gpu_scaled_cpu_write(depth,rows*NV2A_HOST_DEPTH_STRIDE*sizeof(float));
+    NvGpuState target={0};
+    target.bpp=surface_bpp();
+    target.format=s_gpu.format;
+    target.pitch=s_gpu.pitch;
+    target.width=s_gpu.pitch/target.bpp;
+    unsigned depth_rows=s_gpu.clip_y+s_gpu.clip_h;
+    target.height=depth_rows;
+    if(((target.format>>8)&15)==2) {
+        target.width=1u<<((target.format>>16)&15);
+        target.height=1u<<((target.format>>24)&15);
+    } else if((uint64_t)s_gpu.clip_x+s_gpu.clip_w>target.width) {
+        target.width=s_gpu.clip_x+s_gpu.clip_w;
+    }
+    target.color_mask=s_gpu.color_mask;
+    target.depth_mask=s_gpu.depth_mask;
+    s_scaled_cpu=nv_gpu_scaled_cpu_draw(&target,s_surface,depth,NV2A_HOST_DEPTH_STRIDE,depth_rows);
+}
+
+static NvGpuScaledSample *scaled_cpu_block(NvGpuScaledSample *samples,int x,int y)
+{
+    unsigned scale=s_scaled_cpu.scale;
+    return samples+((size_t)y*NV2A_SCANOUT_WIDTH*scale+x)*scale;
 }
 #endif
 
@@ -1315,44 +1334,15 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
     }
 }
 
-static void put_pixel_core(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
-                           int count_stats)
+static uint32_t blend_pixel(uint32_t src, uint32_t dst, uint32_t keep)
 {
-    uint8_t *row;
-
-    (void)mem;
-    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
-        return;
-    if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
-        return;
-    if(count_stats) {
-        s_gpu.pixels++;
-        if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu)) s_gpu.pixel_max = argb;
-    }
-    row = s_surface + surface_pixel_offset(bpp, (uint32_t)x, (uint32_t)y);
-    x = 0; /* row now points to the exact destination pixel for either layout. */
-
-    /* Blending, with the GL factor set and equations the NV2A takes.
-     *
-     * Only SRC_ALPHA / ONE_MINUS_SRC_ALPHA used to be honoured and every other
-     * pair was written opaque. Menus never noticed; a race does: Burnout 3
-     * finishes its 3D frame with screen-space passes that modulate or add
-     * over the scene, and written opaque they paint the whole view over. */
     if (s_gpu.blend_enable
         && !(s_gpu.blend_sfactor == 1 && s_gpu.blend_dfactor == 0)) {
-        uint32_t dst = 0xFF000000u;
         float sc[4], dc[4], sf[4], df[4], out[4];
         int k;
-        if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
-        } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
-            dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
-                | ((t & 0x001Fu) << 3);
-        }
         for (k = 0; k < 4; k++) {           /* r g b a, 0..1 */
             int sh = k == 3 ? 24 : 16 - 8 * k;
-            sc[k] = (float)((argb >> sh) & 0xFF) / 255.0f;
+            sc[k] = (float)((src >> sh) & 0xFF) / 255.0f;
             dc[k] = (float)((dst  >> sh) & 0xFF) / 255.0f;
         }
         blend_factor(s_gpu.blend_sfactor, sc, dc, sf);
@@ -1367,31 +1357,65 @@ static void put_pixel_core(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t ar
             default:     out[k] = a + b; break;               /* ADD          */
             }
         }
-        argb = pack_color(out);
+        src = pack_color(out);
     }
+    return (src & ~keep) | (dst & keep);
+}
+
+static void put_pixel_core(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb,
+                           int count_stats)
+{
+    (void)mem;
+    if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
+        return;
+    if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
+        return;
+    if(count_stats) {
+        s_gpu.pixels++;
+        if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu)) s_gpu.pixel_max = argb;
+    }
+    uint8_t *pixel=s_surface+surface_pixel_offset(bpp,(uint32_t)x,(uint32_t)y);
+    uint32_t keep=0;
 
     if (s_gpu.color_mask != 0x01010101u) {
-        uint32_t keep = 0, old;
         if (!(s_gpu.color_mask & 0x01000000u)) keep |= 0xFF000000u;
         if (!(s_gpu.color_mask & 0x00010000u)) keep |= 0x00FF0000u;
         if (!(s_gpu.color_mask & 0x00000100u)) keep |= 0x0000FF00u;
         if (!(s_gpu.color_mask & 0x00000001u)) keep |= 0x000000FFu;
         if (keep == 0xFFFFFFFFu)
             return;
-        if (bpp == 4) {
-            old = ((const uint32_t *)row)[x];
-        } else {
-            uint32_t t = ((const uint16_t *)row)[x];
-            old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
-        }
-        argb = (argb & ~keep) | (old & keep);
     }
+    int reads_destination=keep || (s_gpu.blend_enable &&
+        !(s_gpu.blend_sfactor==1 && s_gpu.blend_dfactor==0));
+    uint32_t dst=0xFF000000u;
+    if(reads_destination) {
+        if(bpp==4)dst=*(const uint32_t *)pixel;
+        else if(bpp==2) {
+            uint32_t t=*(const uint16_t *)pixel;
+            dst|=((t&0xF800u)<<8)|((t&0x07E0u)<<5)|((t&0x001Fu)<<3);
+        }
+    }
+    uint32_t result=reads_destination?blend_pixel(argb,dst,keep):argb;
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        if(s_scaled_cpu.color) {
+            unsigned scale=s_scaled_cpu.scale,width=NV2A_SCANOUT_WIDTH*scale;
+            NvGpuScaledSample *block=scaled_cpu_block(s_scaled_cpu.color,x,y);
+            /* If an intervening guest write changed the center, apply this
+             * effect on top of the guest's newer color across that block. */
+            unsigned center=nv2a_native_sample(0,scale);
+            int blend_samples=reads_destination && block[center*width+center].color==dst;
+            for(unsigned dy=0;dy<scale;dy++)
+                for(unsigned dx=0;dx<scale;dx++) {
+                    NvGpuScaledSample *sample=block+dy*width+dx;
+                    sample->color=blend_samples && sample->color!=dst?
+                        blend_pixel(argb,sample->color,keep):result;
+                }
+        }
+#endif
+        *(uint32_t *)pixel=result;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+        *(uint16_t *)pixel=(uint16_t)(((result>>8)&0xF800)|((result>>5)&0x07E0)|((result>>3)&0x001F));
     }
 }
 
@@ -1480,6 +1504,9 @@ static void raster_triangle(const float a[2], const float b[2],
             put_pixel(mem, bpp, x, y, argb);
         }
     }
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+    s_scaled_cpu=(NvGpuScaledCpuDraw){0};
+#endif
     s_gpu.tris_drawn++;
     note_drawn();
 }
@@ -2129,8 +2156,20 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             continue;
                     }
                 }
-                if (zp && s_gpu.depth_mask)
+                if (zp && s_gpu.depth_mask) {
                     *zp = z;
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+                    if(s_scaled_cpu.depth && x<NV2A_SCANOUT_WIDTH) {
+                        unsigned scale=s_scaled_cpu.scale,width=NV2A_SCANOUT_WIDTH*scale;
+                        NvGpuScaledSample *block=scaled_cpu_block(s_scaled_cpu.depth,x,y);
+                        uint32_t bits;
+                        memcpy(&bits,&z,sizeof bits);
+                        for(unsigned dy=0;dy<scale;dy++)
+                            for(unsigned dx=0;dx<scale;dx++)
+                                block[dy*width+dx].depth_bits=bits;
+                    }
+#endif
+                }
                 if (s_gpu.zpass_enable)
                     cnt->zpass++;
                 if (!(s_gpu.color_mask & 0x01010101u))
@@ -2618,6 +2657,9 @@ static void xf_flush_jobs(void)
         scaled_cpu_draw(s_xf_jobs[0].tri.zb);
 #endif
         xf_jobs_parallel(s_xf_jobs, s_xf_job_count, &cnt);
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        s_scaled_cpu=(NvGpuScaledCpuDraw){0};
+#endif
         xf_publish_count(&cnt);
     }
     s_xf_job_count = 0;
@@ -2742,6 +2784,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         scaled_cpu_draw(T.zb);
 #endif
         xf_rows_parallel(&T, &cnt);
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        s_scaled_cpu=(NvGpuScaledCpuDraw){0};
+#endif
         xf_publish_count(&cnt);
     }
     s_gpu.tris_drawn++;

@@ -1,13 +1,17 @@
 /* The guest owns the original color/depth layout. Two optional CPU snapshots
  * preserve finer samples across full GPU drains and backbuffer swaps. A
  * guest write can invalidate either channel without invalidating the other. */
+static int gpu_scaled_layout(const NvGpuState *target)
+{
+    return target->width == NV2A_SCANOUT_WIDTH &&
+       target->bpp == 4 && target->pitch == NV2A_SCANOUT_WIDTH * 4 &&
+       ((target->format >> 8) & 15) == 1 && !(target->format & 0xF000u);
+}
+
 static unsigned gpu_scaled_target(const NvGpuState *target)
 {
     if(g.native && g.scaled.scale > 1 && (!g.selftest || g.scaled.testing) && !s_capture &&
-       target->width == NV2A_SCANOUT_WIDTH && target->height == NV2A_SCANOUT_HEIGHT &&
-       target->bpp == 4 && target->pitch == NV2A_SCANOUT_WIDTH * 4 &&
-       ((target->format >> 8) & 15) == 1 && !(target->format & 0xF000u))
-        return g.scaled.scale;
+       target->height == NV2A_SCANOUT_HEIGHT && gpu_scaled_layout(target))return g.scaled.scale;
     return 1;
 }
 
@@ -21,20 +25,42 @@ static GpuScaledSnapshot *gpu_scaled_find(const void *color)
     return NULL;
 }
 
-static void gpu_scaled_invalidate(const void *address,size_t bytes)
+/* The executor derives height from the clip rectangle. A shorter view of
+ * an already known backbuffer has the same storage and raster coordinates.
+ * Keep its scaled allocation, using the original clip bounds for the draw. */
+static int gpu_scaled_short_view(const NvGpuState *target,const uint8_t *color,
+                                 const float *depth,unsigned stride)
+{
+    if(!g.native || !g.scaled.scale || g.selftest || s_capture ||
+       target->height>=NV2A_SCANOUT_HEIGHT || !gpu_scaled_layout(target))return 0;
+    if(g.active && g.scaled.active && g.host_color==color && g.target.format==target->format &&
+       (!depth || (g.host_depth==depth && g.depth_stride==stride)))
+        return 1;
+    GpuScaledSnapshot *saved=gpu_scaled_find(color);
+    return saved && saved->color_valid && saved->format==target->format &&
+        (!depth || (saved->depth==depth && saved->stride==stride));
+}
+
+static void gpu_scaled_invalidate_except(const void *address,size_t bytes,
+    const GpuScaledSnapshot *keep_color,const GpuScaledSnapshot *keep_depth)
 {
     for(unsigned i=0;i<2;i++) {
         GpuScaledSnapshot *snapshot=&g.scaled.snapshots[i];
         if(!snapshot->used)continue;
-        if(snapshot->color_valid &&
+        if(snapshot!=keep_color && snapshot->color_valid &&
            gpu_host_overlap(address,bytes,(const void *)snapshot->color,
                             (size_t)snapshot->pitch*NV2A_SCANOUT_HEIGHT))
             snapshot->color_valid=0;
-        if(snapshot->depth_valid &&
+        if(snapshot!=keep_depth && snapshot->depth_valid &&
            gpu_host_overlap(address,bytes,snapshot->depth,
                             ((NV2A_SCANOUT_HEIGHT-1u)*snapshot->stride+NV2A_SCANOUT_WIDTH)*sizeof(float)))
             snapshot->depth_valid=0;
     }
+}
+
+static void gpu_scaled_invalidate(const void *address,size_t bytes)
+{
+    gpu_scaled_invalidate_except(address,bytes,NULL,NULL);
 }
 
 static void gpu_scaled_invalidate_target(const NvGpuState *target,
@@ -51,6 +77,47 @@ void nv_gpu_scaled_cpu_write(const void *address,size_t bytes)
 {
     if(InterlockedCompareExchange(&s_startup,0,0)==2 && g.scaled.scale)
         gpu_scaled_invalidate(address,bytes);
+}
+
+NvGpuScaledCpuDraw nv_gpu_scaled_cpu_draw(const NvGpuState *target,
+    const uint8_t *color,float *depth,unsigned stride,unsigned depth_rows)
+{
+    NvGpuScaledCpuDraw draw={0};
+    if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !g.scaled.scale ||
+       !target->width || !target->height)return draw;
+    GpuScaledSnapshot *keep_color=NULL,*keep_depth=NULL;
+    int fits=target->width<=NV2A_SCANOUT_WIDTH && target->height<=NV2A_SCANOUT_HEIGHT;
+    if(target->color_mask & 0x01010101u) {
+        GpuScaledSnapshot *saved=gpu_scaled_find(color);
+        if(fits && saved && saved->color_valid && target->bpp==4 &&
+           target->pitch==saved->pitch && ((target->format>>8)&15)==1 &&
+           !(target->format&0xF000u) && (target->format&15)==(saved->format&15))
+            keep_color=saved;
+    }
+    if(depth && target->depth_mask && depth_rows<=NV2A_SCANOUT_HEIGHT) {
+        for(unsigned i=0;i<2;i++) {
+            GpuScaledSnapshot *saved=&g.scaled.snapshots[i];
+            if(saved->used && saved->depth_valid && saved->depth==depth &&
+               saved->stride==stride && (!keep_depth || saved->used>keep_depth->used))
+                keep_depth=saved;
+        }
+    }
+    /* A compatible view may update some of a snapshot's samples in place.
+     * Overlapping views in a different layout still invalidate old samples. */
+    if(target->color_mask & 0x01010101u)
+        gpu_scaled_invalidate_except(color,gpu_target_color_bytes(target),keep_color,NULL);
+    if(depth && target->depth_mask)
+        gpu_scaled_invalidate_except(depth,(size_t)depth_rows*stride*sizeof(float),NULL,keep_depth);
+    if(keep_color && keep_color->color_valid)draw.color=keep_color->pixels;
+    if(keep_depth && keep_depth->depth_valid)draw.depth=keep_depth->pixels;
+    if(draw.color || draw.depth) {
+        draw.scale=g.scaled.scale;
+        /* The retained GPU buffer still contains the pre-software samples,
+         * even if the software writes leave every guest center unchanged. */
+        g.resident=0;
+        ++g.scaled.software_batches;
+    }
+    return draw;
 }
 
 static void gpu_scaled_seed(const NvGpuState *target,const uint8_t *color,
@@ -215,10 +282,14 @@ static int gpu_scaled_selftest(void)
 const uint32_t *nv_gpu_scaled_present(const uint8_t *address,
     const uint32_t *native_pixels,unsigned pitch,unsigned bpp,unsigned *scale)
 {
-    if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !g.scaled.scale || s_capture || bpp!=4)
+    if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !g.scaled.scale || s_capture)
         return NULL;
-    GpuScaledSnapshot *saved=gpu_scaled_find(address);
-    if(!saved || !saved->color_valid || saved->pitch!=pitch)return NULL;
+    GpuScaledSnapshot *saved=bpp==4?gpu_scaled_find(address):NULL;
+    if(!saved || !saved->color_valid || saved->pitch!=pitch) {
+        ++g.scaled.native_frames;
+        return NULL;
+    }
+    ++g.scaled.scaled_frames;
     unsigned factor=g.scaled.scale,width=NV2A_SCANOUT_WIDTH*factor;
     for(unsigned y=0;y<NV2A_SCANOUT_HEIGHT;y++) {
         size_t center=(size_t)nv2a_native_sample(y,factor)*width;

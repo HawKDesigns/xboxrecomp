@@ -57,7 +57,7 @@ typedef struct {
     size_t bytes, palette_bytes, decoded_bytes;
     uint64_t used, version, gpu_serial;
 } GpuTexture;
-typedef struct {uint32_t color,depth_bits;} GpuSurface;
+typedef NvGpuScaledSample GpuSurface;
 #include "nv2a_gpu_surface_copy.h"
 typedef struct {
     GpuSurface *pixels;
@@ -158,6 +158,7 @@ static struct {
         uint32_t *present;
         GpuScaledSnapshot snapshots[2];
         uint64_t tick;
+        uint64_t software_batches, native_frames, scaled_frames;
     } scaled;
     int native_diagnostics,vector_combiner,quad_sampling,empty_reject,early_depth;
     int local_rov,local_rov_rejected;
@@ -1867,7 +1868,9 @@ int nv_gpu_clear_color(const NvGpuState *s,uint8_t *color,
     if(InterlockedCompareExchange(&s_startup,0,0)!=2 && !gpu_startup_owned())return 0;
     if(!g.active)return gpu_clear_skip(0);
     if(color!=g.host_color)return gpu_clear_skip(2);
-    if(s->width!=g.target.width || s->height!=g.target.height ||
+    int height_matches=s->height==g.target.height ||
+        (g.scaled.active && s->height<g.target.height && bottom<=s->height);
+    if(s->width!=g.target.width || !height_matches ||
        s->pitch!=g.target.pitch || s->bpp!=g.target.bpp || s->format!=g.target.format) {
         if(!g.selftest && g.clear_skips[3]<4)fprintf(stderr,"[GPU-CLEAR-LAYOUT] requested=%ux%u pitch=%u format=%08X active=%ux%u pitch=%u format=%08X\n",
             s->width,s->height,s->pitch,s->format,g.target.width,g.target.height,g.target.pitch,g.target.format);
@@ -1994,6 +1997,11 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
         refs+=(unsigned)(((t->maxx-1)/16-t->minx/16+1)*((t->maxy-1)/16-t->miny/16+1));
         if(refs>NV_GPU_MAX_REFERENCES)goto fallback;
     }
+    NvGpuState next=*s;
+    if(gpu_scaled_short_view(s,color,depth,stride)) {
+        next.height=NV2A_SCANOUT_HEIGHT;
+        s=&next;
+    }
     /* A completion token can leave the producer's guest pixels unpublished.
      * Exact ARGB feedback can use the existing private GPU snapshot and
      * texture bridge; it still retains a pending CPU publication obligation.
@@ -2053,7 +2061,7 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
     }
     if(probe){double now=gpu_ms();probe_phase[2]=now-probe_begin;probe_begin=now;}
     ++g.tick;
-    NvGpuState next=*s;phase=gpu_ms();
+    phase=gpu_ms();
     for(int i=0;i<4;i++) {
         g.bound[i]=NULL;
         if(s->tex[i].valid) {
@@ -3457,6 +3465,12 @@ void nv_gpu_report(void)
 {
     if(InterlockedCompareExchange(&s_startup,0,0)!=2)return;
     gpu_raw_report();gpu_timing_report();
+    if(g.scaled.scale) {
+        fprintf(stderr,"[RENDER-SCALE-FRAMES] factor=%u scaled=%llu native=%llu mixed_batches=%llu\n",
+            g.scaled.scale,(unsigned long long)g.scaled.scaled_frames,
+            (unsigned long long)g.scaled.native_frames,(unsigned long long)g.scaled.software_batches);
+        g.scaled.scaled_frames=g.scaled.native_frames=g.scaled.software_batches=0;
+    }
     fprintf(stderr,"[GPU-COMPLETION] enabled=%d waits=%llu marker_wait_ms=%.3f full_surface_pixels_deferred=%llu guest_access_drains=%llu feedback_enabled=%d feedback_snapshots=%llu feedback_fallbacks=%llu\n",
         g.completion.enabled,(unsigned long long)g.completion.waits,g.completion.wait_ms,
         (unsigned long long)g.completion.avoided_pixels,(unsigned long long)g.completion.access_drains,
@@ -3696,4 +3710,10 @@ const uint32_t *nv_gpu_scaled_present(const uint8_t *address,const uint32_t *nat
                                      unsigned pitch,unsigned bpp,unsigned *scale)
 {(void)address;(void)native_pixels;(void)pitch;(void)bpp;(void)scale;return NULL;}
 void nv_gpu_scaled_cpu_write(const void *address,size_t bytes){(void)address;(void)bytes;}
+NvGpuScaledCpuDraw nv_gpu_scaled_cpu_draw(const NvGpuState *target,
+    const uint8_t *color,float *depth,unsigned stride,unsigned depth_rows)
+{
+    (void)target;(void)color;(void)depth;(void)stride;(void)depth_rows;
+    return (NvGpuScaledCpuDraw){0};
+}
 #endif

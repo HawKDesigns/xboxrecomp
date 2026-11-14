@@ -97,4 +97,14 @@ const uint32_t *nv_gpu_scaled_present(const uint8_t *address,
 /* Explicit CPU clears can overwrite samples even when the guest center
  * already equals the clear value. */
 void nv_gpu_scaled_cpu_write(const void *address,size_t bytes);
+typedef struct {uint32_t color, depth_bits;} NvGpuScaledSample;
+typedef struct {
+    NvGpuScaledSample *color, *depth;
+    unsigned scale;
+} NvGpuScaledCpuDraw;
+/* After a full drain, expose compatible sample channels for a software
+ * raster batch. Each worker may update only the rows it owns. The pointers
+ * are valid until the next GPU call. */
+NvGpuScaledCpuDraw nv_gpu_scaled_cpu_draw(const NvGpuState *target,
+    const uint8_t *color, float *depth, unsigned depth_stride, unsigned depth_rows);
 #endif
