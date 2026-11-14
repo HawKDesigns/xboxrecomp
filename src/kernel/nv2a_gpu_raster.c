@@ -5,6 +5,7 @@
 #include "nv2a_gpu_raster.h"
 #include "platform/frame_trace.h"
 #include "nv2a_frame_profile.h"
+#include "nv2a_render_scale.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,14 @@ typedef struct {
 } GpuTexture;
 typedef struct {uint32_t color,depth_bits;} GpuSurface;
 #include "nv2a_gpu_surface_copy.h"
+typedef struct {
+    GpuSurface *pixels;
+    uintptr_t color;
+    const float *depth;
+    unsigned stride, pitch, format;
+    int color_valid, depth_valid;
+    uint64_t used;
+} GpuScaledSnapshot;
 typedef struct {
     GpuBuffer color,depth,surface;
     int native;
@@ -141,6 +150,15 @@ static struct {
     ID3D11RenderTargetView *raster_view;
     unsigned raster_width,raster_height;
     int native,uav_only;
+    struct {
+        unsigned scale, compiling, active;
+        int testing,reused;
+        ID3D11PixelShader *shader;
+        GpuSurface *upload;
+        uint32_t *present;
+        GpuScaledSnapshot snapshots[2];
+        uint64_t tick;
+    } scaled;
     int native_diagnostics,vector_combiner,quad_sampling,empty_reject,early_depth;
     int local_rov,local_rov_rejected;
     unsigned skip_unchanged,store_ready,store_rejected;
@@ -487,6 +505,11 @@ static size_t gpu_color_at(const NvGpuState *s, unsigned x, unsigned y)
     return (size_t)y*s->pitch+(size_t)x*s->bpp;
 }
 static int gpu_flush(void);
+static uintptr_t gpu_canonical_host(const void *address);
+static int gpu_host_overlap(const void *address,size_t bytes,const void *other,size_t other_bytes);
+static size_t gpu_target_color_bytes(const NvGpuState *s);
+static size_t gpu_target_depth_bytes(const NvGpuState *s,unsigned stride);
+#include "nv2a_gpu_render_scale.inc"
 static unsigned gpu_target_shape(unsigned width,unsigned height)
 {
     if(width==640 && height==480)return 0;
@@ -533,8 +556,11 @@ static double gpu_readback_enqueue_current(void)
     gpu_completion_invalidate();
     double begin=gpu_ms();
     unsigned timing=gpu_timing_batch_begin(1);if(timing)gpu_timing_phase_begin(NV_GPU_TIME_COPY,(uint64_t)g.target.width*g.target.height);
-    if(g.native)gpu_copy_dirty_surface((ID3D11Resource*)g.surface.readback,(ID3D11Resource*)g.surface.buffer,
-        g.target.width,g.target.height,g.dirty_top,g.dirty_bottom);
+    if(g.native){
+        unsigned scale=g.scaled.active ? g.scaled.active : 1;
+        gpu_copy_dirty_surface((ID3D11Resource*)g.surface.readback,(ID3D11Resource*)g.surface.buffer,
+            g.target.width*scale,g.target.height*scale,g.dirty_top*scale,g.dirty_bottom*scale);
+    }
     else {
         ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.color.readback,(ID3D11Resource*)g.color.buffer);
         ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.depth.readback,(ID3D11Resource*)g.depth.buffer);
@@ -576,7 +602,9 @@ static int gpu_readback_current_mode(const char *reason,int enqueued,double enqu
         g.readback_time.map_wait_ms+=unpack_begin-map_begin;
         g.target_shape[gpu_target_shape(g.target.width,g.target.height)].map_wait_ms+=unpack_begin-map_begin;
     }
-    if(g.native) {
+    if(g.scaled.active) {
+        gpu_scaled_unpack(surface.pData);
+    } else if(g.native) {
         const GpuSurface *pixels=surface.pData;
         for(unsigned y=g.dirty_top;y<g.dirty_bottom;y++) {
             unsigned at=y*g.target.width+g.dirty_left,count=g.dirty_right-g.dirty_left;
@@ -631,6 +659,7 @@ static int gpu_readback_current_mode(const char *reason,int enqueued,double enqu
         ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)g.depth.readback,0);
     }
     if(stats.pData)ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)g.stats.readback,0);
+    if(g.target_written && g.scaled.active)gpu_scaled_save();
     g.active=0;g.completion.unpublished=0;
     if(!g.selftest){
         double end=gpu_ms(),ms=end-begin;++g.readbacks;g.readback_ms+=ms;
@@ -755,21 +784,23 @@ int nv_gpu_guest_access(uint64_t address,uint64_t bytes)
     /* Only the FIFO/executor owner calls this, after startup publication. */
     if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !bytes)return 1;
     if(g.fast_pending_access && !g.pending_count &&
-       !(g.active && (g.resume.active || g.completion.unpublished)))return 1;
+       !(g.active && (g.resume.active || g.completion.unpublished || g.scaled.active)))return 1;
     uintptr_t base=(uintptr_t)xbox_GetMemoryOffset();
     if(address>UINT32_MAX || bytes>0x100000000ull-address || address>UINTPTR_MAX-base || bytes>SIZE_MAX)
-        return ((g.resume.active || g.completion.unpublished) && g.active?
+        return ((g.resume.active || g.completion.unpublished || g.scaled.active) && g.active?
             gpu_readback("completion-invalid-access"):gpu_pending_drain())?1:-1;
     const void *p=(const void*)(base+(uintptr_t)address);
     if(!gpu_pending_access(p,(size_t)bytes,GPU_DEP_GUEST_ACCESS))return -1;
     /* A resumed target can have an older queued version at the same address.
      * A real CPU access must observe its latest active writes, including when
      * another dependency has already consumed that older queued version. */
-    if((g.resume.active || g.completion.unpublished) && g.active &&
+    if((g.resume.active || g.completion.unpublished || g.scaled.active) && g.active &&
        (gpu_host_overlap(p,(size_t)bytes,g.host_color,gpu_target_color_bytes(&g.target)) ||
         gpu_host_overlap(p,(size_t)bytes,g.host_depth,gpu_target_depth_bytes(&g.target,g.depth_stride)))) {
         if(g.completion.unpublished && !g.selftest)++g.completion.access_drains;
-        return gpu_readback_current(g.resume.active?"resumed-host-access":"completion-host-access")?1:-1;
+        const char *reason=g.scaled.active?"scaled-host-access":
+            (g.resume.active?"resumed-host-access":"completion-host-access");
+        return gpu_readback_current(reason)?1:-1;
     }
     return 1;
 }
@@ -837,6 +868,8 @@ static int gpu_queue_snapshot(GpuPendingReadback *pending)
 static int gpu_queue_readback(void)
 {
     if(!g.active)return 1;
+    /* Queued feedback snapshots and resume speak the guest-sized layout. */
+    if(g.scaled.active)return 0;
     if(g.pending_count==NV_GPU_PENDING_READBACKS) {
         if(!g.selftest)++g.pending_capacity;
         if(!gpu_pending_drain())return -1;
@@ -1271,17 +1304,26 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
         }
     }
     if(g.active)return 1;
-    int resumed=gpu_resume_target(s,color,depth,stride);
+    unsigned scale=gpu_scaled_target(s);
+    int resumed=scale==1?gpu_resume_target(s,color,depth,stride):0;
     if(resumed){
+        g.scaled.active=0;
         if(resumed>0){g.seed.snapshot_valid=0;g.seed.depth_dirty=1;}
         return resumed>0?1:0;
     }
     if(!gpu_pending_access(color,gpu_target_color_bytes(s),GPU_DEP_TARGET_COLOR) ||
        (depth && !gpu_pending_access(depth,gpu_target_depth_bytes(s,stride),GPU_DEP_TARGET_DEPTH)))return -1;
     double bind_begin=gpu_ms();
-    if(g.native && !gpu_native_target(s->width,s->height))return 0;
     unsigned bytes=s->width*s->height*4;
-    if(!gpu_target_buffers(bytes))return 0;
+    if(g.native && !gpu_native_target(s->width*scale,s->height*scale))return 0;
+    int scaled_reuse=g.scaled.active && g.scaled.active==scale && g.resident &&
+        g.host_color==color && g.host_depth==depth && g.depth_stride==stride &&
+        g.target.format==s->format && g.target.pitch==s->pitch &&
+        gpu_scaled_reuse(s,color,depth,stride);
+    if(!gpu_target_buffers(bytes*scale*scale))return 0;
+    if((g.scaled.active || scale>1) && !scaled_reuse)g.resident=0;
+    g.scaled.active=scale>1?scale:0;
+    g.scaled.reused=scaled_reuse;
     int color_changed=!g.resident,depth_changed=!g.resident;
     for(unsigned y=0;y<s->height;y++) {
         unsigned at=y*s->width;
@@ -1305,7 +1347,11 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
         } else for(unsigned x=0;x<s->width;x++)
             if(!g.resident || g.depth_upload[at+x]!=3.4e38f){depth_changed=1;g.depth_upload[at+x]=3.4e38f;}
     }
-    if(g.native) {
+    if(g.scaled.active && !scaled_reuse) {
+        gpu_completion_invalidate();
+        gpu_scaled_seed(s,color,depth,stride);
+        ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.surface.buffer,0,NULL,g.scaled.upload,0,0);
+    } else if(g.native && !g.scaled.active) {
         if(color_changed || depth_changed) {
             gpu_completion_invalidate();
             for(unsigned at=0;at<bytes/4;at++) {
@@ -1314,7 +1360,7 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
             }
             ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.surface.buffer,0,NULL,g.surface_upload,0,0);
         }
-    } else {
+    } else if(!g.native) {
         if(color_changed)ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.color.buffer,0,NULL,g.color_upload,0,0);
         if(depth_changed)ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.depth.buffer,0,NULL,g.depth_upload,0,0);
     }
@@ -1607,6 +1653,9 @@ static int gpu_flush(void)
 {
     if(!g.queued_count)return 1;
     gpu_completion_invalidate();
+    if(g.scaled.scale && !g.scaled.active)
+        for(unsigned i=0;i<g.state_count;i++)
+            gpu_scaled_invalidate_target(g.queued_state+i,g.host_color,g.host_depth,g.depth_stride);
     /* Benchmark only a fresh target's real immutable queue. No prior GPU
      * writes may be missing from its CPU input, and captures remain exact. */
     if(g.auto_enabled && !g.auto_done && !g.auto_busy && !g.selftest && g.native &&
@@ -1670,17 +1719,20 @@ static int gpu_flush(void)
     ID3D11ShaderResourceView *srv[5]={triangles->srv,references->srv,tile_data->srv,states->srv,g.atlas.srv};
     ID3D11UnorderedAccessView *uav[4]={g.native?g.surface.uav:g.color.uav,g.native?NULL:g.depth.uav,g.stats.uav,NULL};
     if(g.native) {
-        gpu_literal_prepare();
+        unsigned scale=g.scaled.active?g.scaled.active:1;
+        unsigned width=g.target.width*scale,height=g.target.height*scale;
+        float origin=scale%2==0?0.5f:0.0f;
+        if(!g.scaled.active)gpu_literal_prepare();
         gpu_depth_seed_prepare();
         ID3D11DeviceContext_PSSetShaderResources(g.context,7,1,&material_srv);
         ID3D11ShaderResourceView *seed_srv[2]={g.seed.enabled?g.seed.image.srv:NULL,g.seed.enabled?g.seed.control.srv:NULL};
         ID3D11DeviceContext_PSSetShaderResources(g.context,5,2,seed_srv);
-        D3D11_VIEWPORT view={0,0,(float)g.target.width,(float)g.target.height,0,1};
+        D3D11_VIEWPORT view={origin,origin,(float)width,(float)height,0,1};
         ID3D11DeviceContext_IASetInputLayout(g.context,NULL);
         if(g.native_batch)ID3D11DeviceContext_IASetIndexBuffer(g.context,g.vertex_ids,DXGI_FORMAT_R32_UINT,0);
         ID3D11DeviceContext_IASetPrimitiveTopology(g.context,D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D11DeviceContext_RSSetViewports(g.context,1,&view);
-        if(g.coverage){D3D11_RECT scissor={0,0,(LONG)g.target.width,(LONG)g.target.height};ID3D11DeviceContext_RSSetScissorRects(g.context,1,&scissor);}
+        if(g.coverage){D3D11_RECT scissor={0,0,(LONG)width,(LONG)height};ID3D11DeviceContext_RSSetScissorRects(g.context,1,&scissor);}
         ID3D11DeviceContext_RSSetState(g.context,g.coverage?(ID3D11RasterizerState*)g.coverage_rasterizer:g.rasterizer);
         ID3D11DeviceContext_VSSetShader(g.context,g.coverage?g.coverage_vertex_shader:g.vertex_shader,NULL,0);
         ID3D11DeviceContext_VSSetShaderResources(g.context,0,5,srv);
@@ -1691,7 +1743,8 @@ static int gpu_flush(void)
         /* One immutable upload spans adjacent material classes. Indexed IDs
          * address the original triangle/state without modifying pixel shaders. */
         unsigned factor=g.coverage?3u:6u;
-        if(gpu_timing_material_wants()){
+        if(g.scaled.active && g.native_batch)gpu_timing_material_select(1);
+        else if(gpu_timing_material_wants()){
             unsigned runs=0;
             for(unsigned first=0;first<g.queued_count;){
                 int simple,fused;unsigned literal;
@@ -1702,16 +1755,20 @@ static int gpu_flush(void)
         }
         gpu_timing_phase_begin(NV_GPU_TIME_PIXELS,g.queued_count);
         for(unsigned first=0;first<g.queued_count;){
-            int simple,fused;unsigned literal;
-            unsigned end=gpu_native_span(first,&simple,&literal,&fused);
-            ID3D11PixelShader *pixel=simple?g.simple_pixel_shader:(literal?g.literal.shader[literal-1]:g.pixel_shader);
+            int simple=0,fused=0;
+            unsigned literal=0,end=g.queued_count;
+            if(!g.scaled.active || !g.native_batch)
+                end=gpu_native_span(first,&simple,&literal,&fused);
+            if(g.scaled.active)simple=literal=0;
+            ID3D11PixelShader *pixel=g.scaled.active?g.scaled.shader:
+                (simple?g.simple_pixel_shader:(literal?g.literal.shader[literal-1]:g.pixel_shader));
             ID3D11DeviceContext_PSSetShader(g.context,pixel,NULL,0);
             unsigned material_token=gpu_timing_material_begin(simple?1u:(literal?literal+1u:0u),end-first);
             /* Non-indexed SV_VertexID restarts at zero. */
             if(g.native_batch)ID3D11DeviceContext_DrawIndexed(g.context,factor*(end-first),factor*first,0);
             else ID3D11DeviceContext_Draw(g.context,factor*(end-first),0);
             gpu_timing_material_end(material_token);
-            gpu_shade_probe_replay(material_token,simple,first,end,factor);
+            if(!g.scaled.active)gpu_shade_probe_replay(material_token,simple,first,end,factor);
             ++commands;if(simple){++simple_commands;simple_triangles+=end-first;}
             if(!g.selftest){
                 if(fused){++g.micro_fuse.fused_draws;g.micro_fuse.runs_saved+=(unsigned)fused-1;g.micro_fuse.triangles+=end-first;}
@@ -1777,7 +1834,14 @@ static int gpu_clear(unsigned left,unsigned top,unsigned right,unsigned bottom,u
     double begin=gpu_ms();
     if(!gpu_flush())return -1;
     gpu_completion_invalidate();
-    uint32_t parameters[9]={g.target.width,g.target.height,left,top,right,bottom,mask,color,0};
+    if(g.scaled.scale && !g.scaled.active) {
+        if(mask&1u)gpu_scaled_invalidate(g.host_color,gpu_target_color_bytes(&g.target));
+        if((mask&2u) && g.host_depth)
+            gpu_scaled_invalidate(g.host_depth,gpu_target_depth_bytes(&g.target,g.depth_stride));
+    }
+    unsigned scale=g.scaled.active?g.scaled.active:1;
+    uint32_t parameters[9]={g.target.width*scale,g.target.height*scale,left*scale,top*scale,
+                            right*scale,bottom*scale,mask,color,0};
     memcpy(parameters+8,&depth,4);
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.clear_parameters.buffer,0,NULL,parameters,0,0);
     ID3D11ShaderResourceView *srv[5]={g.clear_parameters.srv,NULL,NULL,NULL,NULL};
@@ -1785,7 +1849,7 @@ static int gpu_clear(unsigned left,unsigned top,unsigned right,unsigned bottom,u
     ID3D11DeviceContext_CSSetShader(g.context,g.clear_shader,NULL,0);
     ID3D11DeviceContext_CSSetShaderResources(g.context,0,5,srv);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(g.context,0,3,uav,NULL);
-    ID3D11DeviceContext_Dispatch(g.context,((right-left)*(bottom-top)+63)/64,1,1);
+    ID3D11DeviceContext_Dispatch(g.context,((right-left)*(bottom-top)*scale*scale+63)/64,1,1);
     memset(srv,0,sizeof srv);memset(uav,0,sizeof uav);
     ID3D11DeviceContext_CSSetShaderResources(g.context,0,5,srv);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(g.context,0,3,uav,NULL);
@@ -1936,9 +2000,9 @@ static int gpu_draw_ordered(const NvGpuState *s,const NvGpuTri *tri,unsigned n,
      * Depth, palettes, aliases, partial layouts and ambiguous older versions
      * continue through the coherent full readback. Check ALL sampled stages
      * before queuing so an unsupported second stage cannot see stale RAM. */
-    if(g.completion.unpublished && g.active){
+    if(g.active && (g.completion.unpublished || g.scaled.active)){
         int feedback=0,exact=g.completion.feedback_enabled && g.native && g.readback_queue && g.bridge.enabled &&
-            !s_capture && !g.pending_count && g.target.bpp==4 &&
+            !s_capture && !g.scaled.active && !g.pending_count && g.target.bpp==4 &&
             ((color!=g.host_color || depth!=g.host_depth) || g.resume.enabled);
         size_t cb=gpu_target_color_bytes(&g.target);
         size_t db=g.host_depth?gpu_target_depth_bytes(&g.target,g.depth_stride):0;
@@ -2239,7 +2303,7 @@ static int gpu_rov_code(int vertex_mode,int simple,const char *path,uint64_t key
         free(data);fclose(f);if(SUCCEEDED(hr)){
             fprintf(stderr,"[GPU-RASTER] native shader stage=%u cache_hit=1 setup_ms=%.3f\n",stage,gpu_ms()-begin);return 1;}
     }
-    D3D_SHADER_MACRO macros[16];unsigned macro_count=0;
+    D3D_SHADER_MACRO macros[17];unsigned macro_count=0;
     if(vertex)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_VERTEX","1"};
     if(simple)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_SIMPLE_MATERIAL","1"};
     if(!vertex)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_DIAGNOSTIC_COUNTERS",g.native_diagnostics?"1":"0"};
@@ -2255,6 +2319,8 @@ static int gpu_rov_code(int vertex_mode,int simple,const char *path,uint64_t key
     if(!vertex)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_COMPACT_MATERIALS",g.literal.compact_compiling?"1":"0"};
     if(!vertex && g.shade_probe.compiling)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_PROBE_SHADE","1"};
     if(!vertex && simple && g.local_rov)macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_LOCAL_ROV","1"};
+    if(g.scaled.compiling)
+        macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_RENDER_SCALE",g.scaled.compiling==2?"2":"3"};
     macros[macro_count++]=(D3D_SHADER_MACRO){"NV_GPU_ARRAY_REGISTERS",g.array_registers?"1":"0"};
     macros[macro_count]=(D3D_SHADER_MACRO){NULL,NULL};
     ID3DBlob *code=NULL,*errors=NULL;
@@ -2342,6 +2408,56 @@ static int gpu_vertex_ids_initialize(void)
 }
 #include "nv2a_gpu_literal_host.inc"
 #include "nv2a_gpu_store_host.inc"
+static void gpu_scaled_initialize(void)
+{
+    const char *value=getenv("RECOMP_RENDER_SCALE");
+    unsigned scale=value && !strcmp(value,"2")?2:value && !strcmp(value,"3")?3:1;
+    if(scale==1)return;
+    if(!g.native || !g.clear_shader) {
+        fprintf(stderr,"[RENDER-SCALE] %ux requested; native raster and GPU clears required\n",scale);
+        return;
+    }
+
+    unsigned variant=gpu_native_variant(g.array_registers?1u:0u)|(scale<<20);
+    uint64_t key=gpu_compile_key(nv_gpu_rov_source,sizeof(nv_gpu_rov_source)-1,
+                                 "pixel_main","ps_5_0",variant);
+    char path[128];
+    snprintf(path,sizeof path,"shader-cache/qpr2-scaled-%016llx.dxbc",(unsigned long long)key);
+    ID3D11PixelShader *native_shader=g.pixel_shader;
+    g.pixel_shader=NULL;
+    g.scaled.compiling=scale;
+    int compiled=gpu_rov_code(0,0,path,key);
+    g.scaled.shader=g.pixel_shader;
+    g.pixel_shader=native_shader;
+    g.scaled.compiling=0;
+    if(!compiled)goto fallback;
+
+    size_t pixels=NV2A_SCANOUT_WIDTH*NV2A_SCANOUT_HEIGHT*scale*scale;
+    g.scaled.upload=malloc(pixels*sizeof(GpuSurface));
+    g.scaled.present=malloc(pixels*sizeof(uint32_t));
+    for(unsigned i=0;i<2;i++)g.scaled.snapshots[i].pixels=malloc(pixels*sizeof(GpuSurface));
+    if(!g.scaled.upload || !g.scaled.present ||
+       !g.scaled.snapshots[0].pixels || !g.scaled.snapshots[1].pixels)goto fallback;
+
+    g.scaled.scale=scale;
+    g.scaled.testing=1;
+    int passed=gpu_scaled_selftest();
+    g.scaled.testing=0;
+    if(!passed)goto fallback;
+    fprintf(stderr,"[RENDER-SCALE] native raster %ux%u (%ux); guest scanout %ux%u\n",
+            NV2A_SCANOUT_WIDTH*scale,NV2A_SCANOUT_HEIGHT*scale,scale,
+            NV2A_SCANOUT_WIDTH,NV2A_SCANOUT_HEIGHT);
+    return;
+
+fallback:
+    if(g.scaled.shader)ID3D11PixelShader_Release(g.scaled.shader);
+    free(g.scaled.upload);
+    free(g.scaled.present);
+    for(unsigned i=0;i<2;i++)free(g.scaled.snapshots[i].pixels);
+    memset(&g.scaled,0,sizeof g.scaled);
+    fprintf(stderr,"[RENDER-SCALE] %ux setup or offscreen comparison failed; using original resolution\n",scale);
+}
+
 static int gpu_initialize(void)
 {
     const char *hot=getenv("RECOMP_GPU_TEXTURE_HOT");g.texture_hot_enabled=!hot || atoi(hot)>0;
@@ -2685,13 +2801,15 @@ static int gpu_initialize(void)
     }
     if(!gpu_literal_initialize() || g.readback_failed)goto fail;
     if(!gpu_store_initialize() || g.readback_failed)goto fail;
+    gpu_scaled_initialize();
+    if(g.readback_failed)goto fail;
     if(g.seed.control.buffer && g.seed.control_value){
         const uint32_t zero[4]={0};ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.seed.control.buffer,0,NULL,zero,0,0);g.seed.control_value=0;
     }
     g.selftest=0;g.init=3;
     const char *auto_backend=getenv("RECOMP_GPU_AUTOTUNE");
     const char *experimental=getenv("RECOMP_GPU_AUTOTUNE_EXPERIMENT");
-    g.auto_enabled=g.native && experimental && atoi(experimental)>0 && (!auto_backend || atoi(auto_backend)>0);
+    g.auto_enabled=g.native && !g.scaled.scale && experimental && atoi(experimental)>0 && (!auto_backend || atoi(auto_backend)>0);
     const char *empty_stats=getenv("RECOMP_GPU_EMPTY_STATS");
     g.skip_empty_stats=!empty_stats || atoi(empty_stats)>0;
     const char *bulk_texture=getenv("RECOMP_GPU_BULK_TEXTURE");
@@ -3574,4 +3692,8 @@ int nv_gpu_cpu_write_disjoint(const void*a,size_t bytes){(void)a;(void)bytes;ret
 void nv_gpu_report(void){}
 void nv_gpu_capture_request(void){}
 void nv_gpu_capture_present(const uint32_t*p,unsigned w,unsigned h){(void)p;(void)w;(void)h;}
+const uint32_t *nv_gpu_scaled_present(const uint8_t *address,const uint32_t *native_pixels,
+                                     unsigned pitch,unsigned bpp,unsigned *scale)
+{(void)address;(void)native_pixels;(void)pitch;(void)bpp;(void)scale;return NULL;}
+void nv_gpu_scaled_cpu_write(const void *address,size_t bytes){(void)address;(void)bytes;}
 #endif

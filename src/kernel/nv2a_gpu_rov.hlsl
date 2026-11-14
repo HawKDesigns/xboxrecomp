@@ -84,12 +84,29 @@ RWStructuredBuffer<uint> probe_sink : register(u4);
 #ifndef NV_GPU_SKIP_UNCHANGED
 #define NV_GPU_SKIP_UNCHANGED 0
 #endif
+#ifndef NV_GPU_RENDER_SCALE
+#define NV_GPU_RENDER_SCALE 1
+#endif
 float4 pixel_main(RasterInput input) : SV_Target0
 {
     int x=(int)input.position.x,y=(int)input.position.y;
     NvGpuTri tri=triangles[input.primitive];NvGpuState state=configuration[tri.state_index];
+#if NV_GPU_RENDER_SCALE > 1
+    const uint scale=NV_GPU_RENDER_SCALE;
+    if(input.position.x<0 || input.position.y<0 ||
+       x>=(int)(state.width*scale) || y>=(int)(state.height*scale))return 0;
+    uint guest_x=(uint)x/scale, guest_y=(uint)y/scale;
+    uint sx=(uint)x%scale, sy=(uint)y%scale;
+    float px=(float)guest_x+0.5f+((float)sx-(float)(scale/2))/(float)scale;
+    float py=(float)guest_y+0.5f+((float)sy-(float)(scale/2))/(float)scale;
+    NvGpuBary bary=gpu_bary_sample(state,tri,guest_x,guest_y,px,py);
+    uint at=(uint)y*(state.width*scale)+(uint)x;
+    bool guest_sample=sx==scale/2 && sy==scale/2;
+#else
     NvGpuBary bary=gpu_bary(state,tri,x,y);
     uint at=(uint)y*state.width+(uint)x;
+    uint guest_x=x, guest_y=y;
+#endif
     NvGpuSource source;source.argb=source.keep=0;
     int shade=bary.covered;
 #if NV_GPU_DEPTH_SEED
@@ -139,10 +156,14 @@ float4 pixel_main(RasterInput input) : SV_Target0
         /* Explicit visibility is still required after EVERY surface write. */
         DeviceMemoryBarrier();
     }
+#if NV_GPU_RENDER_SCALE == 1
     if(state.width==32 && state.height==32 && input.primitive<8)
         startup_trace[input.primitive*1024+at]=uint4(before,p.color,asuint(p.depth));
+#else
+    if(!guest_sample)return 0;
+#endif
     /* Shard atomics across 16x16 screen tiles instead of one hot address. */
-    uint base=(((uint)y/16)*((state.width+15)/16)+(uint)x/16)*4;
+    uint base=((guest_y/16)*((state.width+15)/16)+guest_x/16)*4;
     /* Guest visibility reports are semantic output. Other per-fragment
      * counters are diagnostics and can be omitted in performance runs. */
     if(p.zpass)InterlockedAdd(statistics[base+2],p.zpass);

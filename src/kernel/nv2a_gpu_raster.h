@@ -90,4 +90,11 @@ int nv_gpu_cpu_write_disjoint(const void *address,size_t bytes);
 void nv_gpu_report(void);
 void nv_gpu_capture_request(void);
 void nv_gpu_capture_present(const uint32_t *pixels,unsigned width,unsigned height);
+/* Return the completed higher-resolution image for this guest scanout, if
+ * resident. Its storage belongs to the executor until the next GPU call. */
+const uint32_t *nv_gpu_scaled_present(const uint8_t *address,
+    const uint32_t *native_pixels, unsigned pitch, unsigned bpp, unsigned *scale);
+/* Explicit CPU clears can overwrite samples even when the guest center
+ * already equals the clear value. */
+void nv_gpu_scaled_cpu_write(const void *address,size_t bytes);
 #endif

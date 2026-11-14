@@ -20,9 +20,10 @@ static inline unsigned pvideo_clamp(int value)
  * `available` bytes of the bank's YUY2 image. Returns 0 without drawing when
  * the bank is not pending, the overlay is stopped, or the registers describe
  * anything this does not handle (only YUY2 is). */
-static inline int pvideo_scanout(const uint32_t *regs, const uint8_t *source,
+static inline int pvideo_scanout_scaled(const uint32_t *regs, const uint8_t *source,
                                  size_t available, uint32_t *dst,
-                                 unsigned width, unsigned height, unsigned bank)
+                                 unsigned width, unsigned height, unsigned bank,
+                                 unsigned scale)
 {
 #define PV(reg) regs[((reg) + bank * 4u) / 4u]
     unsigned format = PV(NV_PVIDEO_FORMAT);
@@ -50,25 +51,36 @@ static inline int pvideo_scanout(const uint32_t *regs, const uint8_t *source,
         if (sy >= ih) continue;
         for (x = 0; x < ow && (uint64_t)ox + x < width; ++x) {
             uint64_t sx = (start_s + (uint64_t)x * PV(NV_PVIDEO_DS_DX)) >> 20;
-            uint32_t *pixel = dst + (size_t)(oy + y) * width + ox + x;
+            uint32_t *pixel = dst + (size_t)(oy + y) * width * scale * scale + (ox + x) * scale;
             const uint8_t *pair;
             int c, u, v;
             if (sx >= iw) continue;
             if ((format & NV_PVIDEO_FORMAT_DISPLAY) &&
-                (*pixel & 0xffffffu) != (regs[NV_PVIDEO_COLOR_KEY / 4] & 0xffffffu))
+                (pixel[(scale/2u)*(width*scale+1u)] & 0xffffffu) !=
+                    (regs[NV_PVIDEO_COLOR_KEY / 4] & 0xffffffu))
                 continue;
             pair = source + (size_t)sy * pitch + (size_t)(sx & ~1ull) * 2;
             c = pair[(sx & 1u) * 2] - 16;
             u = pair[1] - 128;
             v = pair[3] - 128;
-            *pixel = 0xff000000u |
+            uint32_t color = 0xff000000u |
                 (pvideo_clamp((298*c + 409*v + 128) >> 8) << 16) |
                 (pvideo_clamp((298*c - 100*u - 208*v + 128) >> 8) << 8) |
                 pvideo_clamp((298*c + 516*u + 128) >> 8);
+            for(unsigned dy=0;dy<scale;dy++)
+                for(unsigned dx=0;dx<scale;dx++)
+                    pixel[(size_t)dy*width*scale+dx]=color;
         }
     }
 #undef PV
     return 1;
+}
+
+static inline int pvideo_scanout(const uint32_t *regs, const uint8_t *source,
+                                 size_t available, uint32_t *dst,
+                                 unsigned width, unsigned height, unsigned bank)
+{
+    return pvideo_scanout_scaled(regs,source,available,dst,width,height,bank,1);
 }
 
 #endif

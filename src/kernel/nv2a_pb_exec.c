@@ -35,6 +35,7 @@
 #include "nv2a_frame_pacing.h"
 #include "platform/frame_trace.h"
 #include "nv2a_frame_profile.h"
+#include "nv2a_render_scale.h"
 #include "platform/thread_cpu.h"
 static NvFramePacing s_frame_pacing;
 unsigned nv2a_pb_exec_overlay_revision(void) { return QPR2_RENDERER_REVISION; }
@@ -690,20 +691,33 @@ static int s_flip_dumping;
 
 /* A completed 640x480 image, identical to the copy handed to the window. */
 static uint32_t *s_completed_frame;
+static uint32_t *s_completed_scaled;
+static unsigned s_completed_scale=1;
 static uint32_t s_completed_flip, s_completed_source;
 static int snapshot_presented_frame(uint32_t offset, uint32_t pitch, uint32_t bpp)
 {
     gpu_finish();
-    if (!s_completed_frame) s_completed_frame=(uint32_t*)malloc(640u*480u*4u);
-    if (!nv2a_frame_copy(s_completed_frame,
-            (const uint8_t*)xbox_GetMemoryOffset()+dma_resolve(offset), pitch, 640,480,bpp)) {
+    const uint8_t *source=(const uint8_t*)xbox_GetMemoryOffset()+dma_resolve(offset);
+    s_completed_scale=1;
+    if (!s_completed_frame) s_completed_frame=malloc(NV2A_SCANOUT_WIDTH*NV2A_SCANOUT_HEIGHT*4u);
+    if (!nv2a_frame_copy(s_completed_frame,source,pitch,NV2A_SCANOUT_WIDTH,NV2A_SCANOUT_HEIGHT,bpp)) {
         static unsigned bad;
         if(bad++<8)fprintf(stderr,"[PRESENT-SHAPE] cannot copy source=%08X pitch=%u bpp=%u\n",offset,pitch,bpp);
         return 0;
     }
     s_completed_flip=s_gpu.flips;s_completed_source=offset;
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
-    nv_gpu_capture_present(s_completed_frame,640,480);
+    unsigned scale=1;
+    const uint32_t *scaled=nv_gpu_scaled_present(source,s_completed_frame,pitch,bpp,&scale);
+    if(scaled) {
+        size_t bytes=(size_t)NV2A_SCANOUT_WIDTH*NV2A_SCANOUT_HEIGHT*scale*scale*4u;
+        if(!s_completed_scaled)s_completed_scaled=malloc(bytes);
+        if(s_completed_scaled) {
+            memcpy(s_completed_scaled,scaled,bytes);
+            s_completed_scale=scale;
+        }
+    }
+    nv_gpu_capture_present(s_completed_frame,NV2A_SCANOUT_WIDTH,NV2A_SCANOUT_HEIGHT);
 #endif
     return 1;
 }
@@ -715,8 +729,10 @@ static void dump_surface_bmp(void)
     if(!prefix || !s_completed_frame || !s_completed_flip)return;
     gpu_finish();
     snprintf(path,sizeof path,"%s%05u.bmp",prefix,seq);
-    if(nv2a_frame_write_bmp(path,s_completed_frame,640,480)) {
-        fprintf(stderr,"[FRAME-CAPTURE] file=%u completed_flip=%u source=%08X size=640x480\n",seq,s_completed_flip,s_completed_source);
+    unsigned width=NV2A_SCANOUT_WIDTH*s_completed_scale,height=NV2A_SCANOUT_HEIGHT*s_completed_scale;
+    const uint32_t *pixels=s_completed_scale==1?s_completed_frame:s_completed_scaled;
+    if(nv2a_frame_write_bmp(path,pixels,width,height)) {
+        fprintf(stderr,"[FRAME-CAPTURE] file=%u completed_flip=%u source=%08X size=%ux%u\n",seq,s_completed_flip,s_completed_source,width,height);
         ++seq;
     }
 }
@@ -775,6 +791,12 @@ static void clear_surface(uint32_t param)
     }
 #endif
     if(!cleared && !disjoint)gpu_finish();
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+    if(!cleared)
+        nv_gpu_scaled_cpu_write(mem+s_gpu.color_base,((s_gpu.format>>8)&15)==2?
+            (size_t)(1u<<((s_gpu.format>>16)&15))*(1u<<((s_gpu.format>>24)&15))*bpp:
+            (size_t)(s_gpu.clip_y+s_gpu.clip_h)*s_gpu.pitch);
+#endif
 
     if (((s_gpu.format >> 8) & 15) == 2) {
         for (y = 0; y < s_gpu.clip_h; y++)
@@ -1250,6 +1272,18 @@ static int surface_begin_batch(const uint8_t *mem)
     return 1;
 }
 
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+static void scaled_cpu_draw(float *depth)
+{
+    size_t rows=s_gpu.clip_y+s_gpu.clip_h;
+    nv_gpu_scaled_cpu_write(s_surface,((s_gpu.format>>8)&15)==2?
+        (size_t)(1u<<((s_gpu.format>>16)&15))*(1u<<((s_gpu.format>>24)&15))*surface_bpp():
+        rows*s_gpu.pitch);
+    if(depth && s_gpu.depth_mask)
+        nv_gpu_scaled_cpu_write(depth,rows*NV2A_HOST_DEPTH_STRIDE*sizeof(float));
+}
+#endif
+
 static uint32_t pack_color(const float c[4]);
 
 /* One GL blend factor, per channel (r g b a). */
@@ -1412,6 +1446,9 @@ static void raster_triangle(const float a[2], const float b[2],
         return;
     }
 
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+    scaled_cpu_draw(NULL);
+#endif
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
             float px = (float)x + 0.5f, py = (float)y + 0.5f;
@@ -1662,7 +1699,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 /* Depth buffers, host-side, one per zeta surface the title uses. The real one
  * lives in guest memory in a tiled format nothing here decodes, and nothing
  * the title does reads it back, so a float buffer per zeta offset is enough. */
-#define NV_ZBUF_W 1024
+#define NV_ZBUF_W NV2A_HOST_DEPTH_STRIDE
 #define NV_ZBUF_H 1024
 static struct { uint32_t offset; float *z; } s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
@@ -1709,6 +1746,9 @@ static float *zbuf_current(int create)
         s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
     if (!s_zbufs[i].z)
         return NULL;
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+    nv_gpu_scaled_cpu_write(s_zbufs[i].z,(size_t)NV_ZBUF_W*NV_ZBUF_H*sizeof(float));
+#endif
     s_zbufs[i].offset = s_gpu.zeta_offset;
     for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
         s_zbufs[i].z[k] = 3.4e38f;
@@ -1718,14 +1758,16 @@ static float *zbuf_current(int create)
 static void zbuf_clear(void)
 {
     float *z = zbuf_current(1), v = zclear_value();
-    int cleared=0;
 #if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
-    cleared=nv_gpu_retire_depth_on_clear(z,NV_ZBUF_W,NV_ZBUF_H,v);
+    int cleared=nv_gpu_retire_depth_on_clear(z,NV_ZBUF_W,NV_ZBUF_H,v);
     if(!cleared)cleared=nv_gpu_clear_depth(z,NV_ZBUF_W,v);
     if(cleared<0){fprintf(stderr,"[GPU-RASTER] stopping after depth-clear submission failure\n");exit(4);}
-    if(!cleared && z)cleared=nv_gpu_cpu_write_disjoint(z,(size_t)NV_ZBUF_W*NV_ZBUF_H*sizeof *z);
+    int disjoint=!cleared && z && nv_gpu_cpu_write_disjoint(z,(size_t)NV_ZBUF_W*NV_ZBUF_H*sizeof *z);
+    if(!cleared && !disjoint)gpu_finish();
+    if(z)nv_gpu_scaled_cpu_write(z,(size_t)NV_ZBUF_W*NV_ZBUF_H*sizeof *z);
+#else
+    gpu_finish();
 #endif
-    if(!cleared)gpu_finish();
     {
         static uint32_t last_format, last_control, last_clear;
         static unsigned reports;
@@ -2572,6 +2614,9 @@ static void xf_flush_jobs(void)
     }
     if(!gpu_submit_jobs()) {
         gpu_finish();
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        scaled_cpu_draw(s_xf_jobs[0].tri.zb);
+#endif
         xf_jobs_parallel(s_xf_jobs, s_xf_job_count, &cnt);
         xf_publish_count(&cnt);
     }
@@ -2693,6 +2738,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         job->tri.a = job->v[0].pos; job->tri.b = job->v[1].pos; job->tri.c = job->v[2].pos;
     } else {
         gpu_finish();
+#if defined(NV2A_ENABLE_GPU_RASTER) && defined(_WIN32)
+        scaled_cpu_draw(T.zb);
+#endif
         xf_rows_parallel(&T, &cnt);
         xf_publish_count(&cnt);
     }
@@ -4035,7 +4083,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 uint32_t bpp=s_gpu.drawn_offset?s_gpu.drawn_bpp:surface_bpp();
                 if(snapshot_presented_frame(done,pitch,bpp)) {
                     xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                    xbox_FramebufferWindowPresentPixels(s_completed_frame, 640, 480, frame_id);
+                    const uint32_t *pixels=s_completed_scale==1?s_completed_frame:s_completed_scaled;
+                    xbox_FramebufferWindowPresentPixels(pixels,NV2A_SCANOUT_WIDTH*s_completed_scale,
+                                                       NV2A_SCANOUT_HEIGHT*s_completed_scale,frame_id);
                     nv_frame_pacing_note(&s_frame_pacing,render_wall_ms());
                 }
             }

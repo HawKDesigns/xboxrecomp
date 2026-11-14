@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The same choice goes to the guest EEPROM and the host presenters. A
- * widescreen guest frame is anamorphic and still has 640x480 samples. */
+/* Select the output rectangle. Console video flags are independent because
+ * some lifted titles cannot initialize their widescreen display mode. */
 static inline int xbox_video_widescreen(void)
 {
     const char *value = getenv("RECOMP_VIDEO_ASPECT");

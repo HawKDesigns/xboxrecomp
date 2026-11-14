@@ -178,11 +178,10 @@ typedef struct NvGpuSource NvGpuSource;
 #endif
 struct NvGpuBary { float l0,l1,l2,depth;uint32_t covered; };
 struct NvGpuSource { uint32_t argb,keep; };
-GPU_FN NvGpuBary gpu_bary(NvGpuState state,NvGpuTri tri,int x,int y)
+GPU_FN NvGpuBary gpu_bary_sample(NvGpuState state,NvGpuTri tri,int x,int y,float px,float py)
 {
     NvGpuBary bary;bary.l0=bary.l1=bary.l2=bary.depth=0;bary.covered=0;
     if (x < tri.minx || x >= tri.maxx || y < tri.miny || y >= tri.maxy) return bary;
-    GPU_PRECISE float px = (float)x+0.5f, py = (float)y+0.5f;
     GPU_PRECISE float w0 = (tri.v[1].pos[0]-tri.v[0].pos[0])*(py-tri.v[0].pos[1])
                          -(tri.v[1].pos[1]-tri.v[0].pos[1])*(px-tri.v[0].pos[0]);
     GPU_PRECISE float w1 = (tri.v[2].pos[0]-tri.v[1].pos[0])*(py-tri.v[1].pos[1])
@@ -197,6 +196,10 @@ GPU_FN NvGpuBary gpu_bary(NvGpuState state,NvGpuTri tri,int x,int y)
     bary.l0=l0;bary.l1=l1;bary.l2=l2;bary.depth=gpu_depth(state,z);bary.covered=1;
     return bary;
 
+}
+GPU_FN NvGpuBary gpu_bary(NvGpuState state,NvGpuTri tri,int x,int y)
+{
+    return gpu_bary_sample(state,tri,x,y,(float)x+0.5f,(float)y+0.5f);
 }
 /* The immutable batch-start depth is only a conservative rejection bound.
  * The short ROV transaction still tests current depth and owns all writes. */

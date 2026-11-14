@@ -94,10 +94,30 @@ static ID3DBlob *compile(const char *entry, const char *target)
     return code;
 }
 
+int gpu_present_resize_source(uint32_t width,uint32_t height)
+{
+    if(s_frame && s_w==width && s_h==height)return 1;
+    D3D11_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc,sizeof desc);
+    desc.Width=width;desc.Height=height;desc.MipLevels=desc.ArraySize=1;
+    desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;desc.SampleDesc.Count=1;
+    desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D *frame=NULL;
+    ID3D11ShaderResourceView *srv=NULL;
+    if(FAILED(ID3D11Device_CreateTexture2D(s_dev,&desc,NULL,&frame)))return 0;
+    if(FAILED(ID3D11Device_CreateShaderResourceView(s_dev,(ID3D11Resource *)frame,NULL,&srv))) {
+        ID3D11Texture2D_Release(frame);
+        return 0;
+    }
+    if(s_srv)ID3D11ShaderResourceView_Release(s_srv);
+    if(s_frame)ID3D11Texture2D_Release(s_frame);
+    s_frame=frame;s_srv=srv;s_w=width;s_h=height;
+    return 1;
+}
+
 int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
 {
     DXGI_SWAP_CHAIN_DESC sd;
-    D3D11_TEXTURE2D_DESC td;
     D3D11_SAMPLER_DESC smp;
     ID3DBlob *vsb, *psb;
     HRESULT hr;
@@ -108,7 +128,6 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     if (v && v[0] == '0')
         s_vsync = 0;
     s_hwnd = hwnd;
-    s_w = width; s_h = height;
     client_size(&s_bw, &s_bh);
     ZeroMemory(&sd, sizeof sd);
     sd.BufferDesc.Width  = s_bw;
@@ -138,10 +157,6 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
             IDXGIFactory_Release(fac);
         }
     }
-    ZeroMemory(&td, sizeof td);
-    td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ZeroMemory(&smp, sizeof smp);
     smp.Filter = s_filter == XBOX_PRESENT_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
                                                 : D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -150,8 +165,7 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     vsb = compile("vs", "vs_4_0");
     psb = compile("ps", "ps_4_0");
     if (!vsb || !psb || !make_rtv()
-        || FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_frame))
-        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_frame, NULL, &s_srv))
+        || !gpu_present_resize_source(width,height)
         || FAILED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_samp))
         || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vsb),
                                                   ID3D10Blob_GetBufferSize(vsb), NULL, &s_vs))

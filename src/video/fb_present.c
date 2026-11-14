@@ -40,6 +40,7 @@
 #include "keyboard.h"   /* src/input */
 #include "gpu_present.h"
 #include "present_layout.h"
+#include "kernel/nv2a_render_scale.h"
 #include "platform/frame_trace.h"
 #include "platform/host_time.h"
 #include "platform/thread_cpu.h"
@@ -56,6 +57,7 @@ static volatile LONG s_fb_running;
 static volatile LONG s_fb_closed;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+static unsigned      s_rgb_scale=1;
 static XboxPresentFilter s_filter;
 static int s_widescreen;
 
@@ -71,6 +73,8 @@ static int s_widescreen;
  * The lock also protects the window's copy: two flips can otherwise reuse
  * the buffer the window is still reading. */
 static uint32_t     *s_present[2];
+static size_t        s_present_capacity[2];
+static unsigned      s_present_scale=1;
 static uint32_t      s_present_frame_id;
 static LONG          s_present_idx = -1;   /* -1 until the first flip */
 static SRWLOCK       s_present_lock = SRWLOCK_INIT;
@@ -121,8 +125,8 @@ static void fb_overlay(void)
         snapshot = (uint8_t *)malloc((size_t)bytes);
         if (!snapshot) continue;
         memcpy(snapshot, (const void *)va, (size_t)bytes);
-        if (!pvideo_scanout(regs, snapshot, (size_t)bytes, s_rgb,
-                            s_fb_width, s_fb_height, bank)) {
+        if (!pvideo_scanout_scaled(regs, snapshot, (size_t)bytes, s_rgb,
+                                   s_fb_width, s_fb_height, bank, s_rgb_scale)) {
             free(snapshot);
             continue;
         }
@@ -135,8 +139,8 @@ static void fb_overlay(void)
         nv2a_hook_pvideo_consume(bank);
     }
     if (!presented && s_pvideo_source)
-        pvideo_scanout(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
-                       s_fb_width, s_fb_height, s_pvideo_bank);
+        pvideo_scanout_scaled(s_pvideo_regs, s_pvideo_source, s_pvideo_bytes, s_rgb,
+                              s_fb_width, s_fb_height, s_pvideo_bank, s_rgb_scale);
     if (presented && xbox_frame_trace_enabled()) {
         static DWORD last_activity;
         DWORD now = GetTickCount();
@@ -149,21 +153,31 @@ static void fb_overlay(void)
 }
 
 /* Publish a resolved frame using the same lock as guest-memory flips. */
+static int fb_reserve_present_slot(LONG slot,size_t bytes)
+{
+    if(s_present_capacity[slot]>=bytes)return 1;
+    uint32_t *pixels=realloc(s_present[slot],bytes);
+    if(!pixels)return 0;
+    s_present[slot]=pixels;
+    s_present_capacity[slot]=bytes;
+    return 1;
+}
+
 void xbox_FramebufferWindowPresentPixels(const uint32_t *pixels,
                                         uint32_t width, uint32_t height, uint32_t frame_id)
 {
-    if (!s_fb_running || !pixels || width != s_fb_width ||
-        height != s_fb_height || getenv("RECOMP_FB_VA"))
+    unsigned scale=width/s_fb_width;
+    if (!s_fb_running || !pixels || scale<1 || scale>NV2A_MAX_RENDER_SCALE ||
+        width!=s_fb_width*scale || height!=s_fb_height*scale || getenv("RECOMP_FB_VA"))
         return;
 
     AcquireSRWLockExclusive(&s_present_lock);
     LONG next = (s_present_idx == 0) ? 1 : 0;
     size_t bytes = (size_t)width * height * sizeof(*pixels);
-    if (!s_present[next])
-        s_present[next] = (uint32_t *)malloc(bytes);
-    if (s_present[next]) {
+    if (fb_reserve_present_slot(next,bytes)) {
         memcpy(s_present[next], pixels, bytes);
         s_present_idx = next;
+        s_present_scale = scale;
         s_present_frame_id = frame_id;
         xbox_frame_trace_note(XBOX_TRACE_RENDERER, XBOX_TRACE_HANDOFF, frame_id, 0, 0, 0);
     }
@@ -206,14 +220,10 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         return;                       /* pinned: leave the old path alone */
     AcquireSRWLockExclusive(&s_present_lock);
     next = (s_present_idx == 0) ? 1 : 0;
-    if (!s_present[next]) {
-        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
-                                             4);
-        if (!s_present[next]) {
-            ReleaseSRWLockExclusive(&s_present_lock);
-            fprintf(stderr, "  [FBWIN] cannot allocate a presentation frame\n");
-            return;
-        }
+    if (!fb_reserve_present_slot(next,(size_t)s_fb_width*s_fb_height*4u)) {
+        ReleaseSRWLockExclusive(&s_present_lock);
+        fprintf(stderr, "  [FBWIN] cannot allocate a presentation frame\n");
+        return;
     }
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
@@ -243,20 +253,29 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         }
     }
     s_present_idx = next;
+    s_present_scale = 1;
     s_present_frame_id = 0;
     ReleaseSRWLockExclusive(&s_present_lock);
 }
 
-static int fb_copy_presented_frame(uint32_t *dst, uint32_t *frame_id)
+static int fb_copy_presented_frame(uint32_t **dst,size_t *capacity,
+                                    unsigned *scale,uint32_t *frame_id)
 {
     int copied = 0;
 
     AcquireSRWLockShared(&s_present_lock);
     if (s_present_idx >= 0) {
-        memcpy(dst, s_present[s_present_idx],
-               (size_t)s_fb_width * s_fb_height * 4);
-        *frame_id = s_present_frame_id;
-        copied = 1;
+        size_t bytes=(size_t)s_fb_width*s_fb_height*s_present_scale*s_present_scale*4u;
+        if(*capacity<bytes) {
+            uint32_t *next=realloc(*dst,bytes);
+            if(next){*dst=next;*capacity=bytes;}
+        }
+        if(*capacity>=bytes) {
+            memcpy(*dst,s_present[s_present_idx],bytes);
+            *frame_id=s_present_frame_id;
+            *scale=s_present_scale;
+            copied=1;
+        }
     }
     ReleaseSRWLockShared(&s_present_lock);
     return copied;
@@ -345,8 +364,15 @@ static void fb_draw_stats(HDC target)
         GdiFlush();
         updated = now;
     }
-    for (unsigned y = 0; y < height; ++y)
-        memcpy(s_rgb + (y + 8) * s_fb_width + 8, s_stats_pixels + y * width, width * sizeof(*s_stats_pixels));
+    for (unsigned y = 0; y < height; ++y) {
+        unsigned stride=s_fb_width*s_rgb_scale;
+        for(unsigned dy=0;dy<s_rgb_scale;dy++) {
+            uint32_t *row=s_rgb+(size_t)((y+8)*s_rgb_scale+dy)*stride+8*s_rgb_scale;
+            for(unsigned x=0;x<width;x++)
+                for(unsigned dx=0;dx<s_rgb_scale;dx++)
+                    row[x*s_rgb_scale+dx]=s_stats_pixels[y*width+x];
+        }
+    }
 }
 
 static void fb_close_stats(void)
@@ -611,8 +637,9 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
 int xbox_FramebufferDumpBmp(const char *path)
 {
     FILE *f;
-    uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
-    uint32_t img = row * s_fb_height, total = 54u + img, y, x;
+    uint32_t width=s_fb_width*s_rgb_scale,height=s_fb_height*s_rgb_scale;
+    uint32_t row = ((width * 3u) + 3u) & ~3u;
+    uint32_t img = row * height, total = 54u + img, y, x;
     uint8_t hdr[54], *line;
 
     if (!s_rgb || !s_fb_va)
@@ -624,16 +651,16 @@ int xbox_FramebufferDumpBmp(const char *path)
     hdr[0] = 'B'; hdr[1] = 'M';
     memcpy(hdr + 2, &total, 4);
     hdr[10] = 54; hdr[14] = 40;
-    memcpy(hdr + 18, &s_fb_width, 4);
-    memcpy(hdr + 22, &s_fb_height, 4);
+    memcpy(hdr + 18, &width, 4);
+    memcpy(hdr + 22, &height, 4);
     hdr[26] = 1; hdr[28] = 24;
     memcpy(hdr + 34, &img, 4);
     fwrite(hdr, 1, sizeof(hdr), f);
 
     line = (uint8_t *)calloc(1, row);
-    for (y = 0; y < s_fb_height; y++) {
-        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
-        for (x = 0; x < s_fb_width; x++) {
+    for (y = 0; y < height; y++) {
+        const uint32_t *src = s_rgb + (size_t)(height - 1 - y) * width;
+        for (x = 0; x < width; x++) {
             line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
             line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
             line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
@@ -643,46 +670,54 @@ int xbox_FramebufferDumpBmp(const char *path)
     free(line);
     fclose(f);
     fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
-            path, s_fb_width, s_fb_height, s_fb_va);
+            path, width, height, s_fb_va);
     return 0;
 }
 
 /* GDI: the frame letterboxed into the client area, like the D3D11
  * presenter; the borders are cleared when the size changes. */
-static int gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+static int gdi_blit(HWND hwnd, HDC hdc, BITMAPINFO *bi)
 {
     static LONG lw, lh;
+    static unsigned last_scale;
     RECT c;
     LONG cw, ch;
     GetClientRect(hwnd, &c);
     cw = c.right - c.left; ch = c.bottom - c.top;
     if (cw <= 0 || ch <= 0)
         return 0;
-    if (cw != lw || ch != lh) {
+    if (cw != lw || ch != lh || last_scale!=s_rgb_scale) {
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
+        last_scale=s_rgb_scale;
     }
-    XboxPresentRect pic = xbox_present_rect(cw, ch, (int)s_fb_width,
-                                            (int)s_fb_height, s_widescreen, s_filter);
+    int width=(int)(s_fb_width*s_rgb_scale),height=(int)(s_fb_height*s_rgb_scale);
+    bi->bmiHeader.biWidth=width;
+    bi->bmiHeader.biHeight=-height;
+    XboxPresentRect pic=xbox_present_rect(cw,ch,width,height,s_widescreen,s_filter);
     SetStretchBltMode(hdc, s_filter == XBOX_PRESENT_LINEAR ? HALFTONE : COLORONCOLOR);
     if (s_filter == XBOX_PRESENT_LINEAR) {
         SetBrushOrgEx(hdc, 0, 0, NULL);  /* HALFTONE wants it after the mode */
     }
     int lines = StretchDIBits(hdc, pic.x, pic.y, pic.width, pic.height,
-                             0, 0, (int)s_fb_width, (int)s_fb_height,
+                             0, 0, width, height,
                              s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
     return lines != 0 && lines != GDI_ERROR;
 }
 
 /* The converted frame in s_rgb, on screen: D3D11 when it is up (which waits
  * for vsync, so returns 1 when the loop is already paced), else GDI. */
-static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi, int *shown)
+static int fb_show(HWND hwnd, HDC hdc, BITMAPINFO *bi, int *shown)
 {
 #ifdef XBOX_FRAME_TELEMETRY
     if (InterlockedCompareExchange(&s_stats_open, 0, 0)) fb_draw_stats(hdc);
 #endif
-    if (gpu_present_active())
-        return gpu_present_frame(s_rgb, shown);
+    if (gpu_present_active()) {
+        if(gpu_present_resize_source(s_fb_width*s_rgb_scale,s_fb_height*s_rgb_scale))
+            return gpu_present_frame(s_rgb, shown);
+        fprintf(stderr,"  [D3D] source resize failed; switching to GDI\n");
+        gpu_present_shutdown();
+    }
     *shown = gdi_blit(hwnd, hdc, bi);
     return 0;
 }
@@ -759,7 +794,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     bi.bmiHeader.biBitCount    = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
-    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    size_t rgb_capacity=(size_t)s_fb_width*s_fb_height*4u;
+    s_rgb=calloc(1,rgb_capacity);
+    if(!s_rgb)rgb_capacity=0;
+    s_rgb_scale=1;
     /* A window pinned to one address shows that memory and nothing else. */
     fb_pinned = getenv("RECOMP_FB_VA") != NULL;
 
@@ -776,7 +814,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_rgb && fb_copy_presented_frame(s_rgb, &frame_id)) {
+        if (fb_copy_presented_frame(&s_rgb,&rgb_capacity,&s_rgb_scale,&frame_id)) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
@@ -788,6 +826,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+            s_rgb_scale=1;
             fb_convert(src, s_fb_pitch / s_fb_width);
             if (!fb_pinned)
                 fb_overlay();

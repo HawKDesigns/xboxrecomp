@@ -121,7 +121,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * settings. On real hardware these are stored in the 256-byte EEPROM on the
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
- *   - Video: NTSC, 4:3 unless the player selects widescreen
+ *   - Video: NTSC, 4:3 at 60 Hz
  *   - Language: English
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
@@ -202,8 +202,9 @@ static void tz_init(void)
 
 static ULONG eeprom_video_flags(void)
 {
+    const char *wide=getenv("RECOMP_GUEST_WIDESCREEN");
     return XC_VIDEO_FLAGS_60Hz |
-           (xbox_video_widescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0);
+           (wide && strcmp(wide,"1")==0 ? XC_VIDEO_FLAGS_WIDESCREEN : 0);
 }
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
