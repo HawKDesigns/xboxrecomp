@@ -79,6 +79,7 @@ static int gpu_resume_target(const NvGpuState *s,uint8_t *color,float *depth,uns
     GpuPendingReadback *p=gpu_resume_source(s,color,depth,stride);
     if(!p)return 0;
     if(!gpu_native_target(s->width,s->height) || !gpu_target_buffers(s->width*s->height*4u))return -1;
+    gpu_completion_invalidate();
     ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.surface.buffer,(ID3D11Resource*)p->snapshot.buffer);
     unsigned pixels=s->width*s->height;
     /* Preserve the CPU input baseline for a later attempt to queue this

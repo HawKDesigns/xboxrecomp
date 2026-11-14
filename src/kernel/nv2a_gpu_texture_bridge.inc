@@ -40,6 +40,7 @@ static int gpu_bridge_pack(GpuPendingReadback *p,unsigned base,unsigned texels)
     if(!p->serial || !p->snapshot.srv || !g.bridge.shader ||
        !g.bridge.parameters.buffer || g.bridge.texels.bytes<texels*4u ||
        (uint64_t)(base+texels)*4u>g.atlas.bytes)return 0;
+    gpu_completion_invalidate();
     uint32_t parameters[4]={texels,0,0,0};
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.bridge.parameters.buffer,0,NULL,parameters,0,0);
     ID3D11ShaderResourceView *srv[5]={p->snapshot.srv,g.bridge.parameters.srv,NULL,NULL,NULL};

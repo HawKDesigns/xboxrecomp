@@ -175,11 +175,11 @@ static struct {
     struct {uint64_t drains;double wait_ms;} dependency_source[6][4];
     struct {uint64_t binds,queued,readbacks,pixels,empty_skips;double map_wait_ms;} target_shape[4];
     struct {
-        int enabled,unpublished,feedback_enabled;
+        int enabled,unpublished,feedback_enabled,reuse_enabled,confirmed;
         GpuBuffer marker;
         ID3D11Buffer *staging;
         unsigned staging_bytes,serial;
-        uint64_t waits,avoided_pixels,access_drains;
+        uint64_t waits,reused,avoided_pixels,access_drains;
         uint64_t feedback_snapshots,feedback_fallbacks;
         double wait_ms;
     } completion;
@@ -247,6 +247,13 @@ static struct {
     } readback_time;
     struct {char name[64];uint64_t count;double ms;} sync_reason[20];
 } g;
+
+/* FIFO owner only. Invalidate when a renderer path can issue a GPU write,
+ * draw or transfer. Queued CPU-side draws also flush before checking this. */
+static void gpu_completion_invalidate(void)
+{
+    g.completion.confirmed=0;
+}
 
 /* Initialization owns only private offscreen data. Guest execution continues
  * on CPU until this release/acquire publication makes the context available.
@@ -518,6 +525,7 @@ static void gpu_copy_dirty_surface(ID3D11Resource *destination,ID3D11Resource *s
  * resources/stats unchanged until gpu_readback_current_mode consumes them. */
 static double gpu_readback_enqueue_current(void)
 {
+    gpu_completion_invalidate();
     double begin=gpu_ms();
     unsigned timing=gpu_timing_batch_begin(1);if(timing)gpu_timing_phase_begin(NV_GPU_TIME_COPY,(uint64_t)g.target.width*g.target.height);
     if(g.native)gpu_copy_dirty_surface((ID3D11Resource*)g.surface.readback,(ID3D11Resource*)g.surface.buffer,
@@ -829,6 +837,7 @@ static int gpu_queue_readback(void)
         if(!gpu_pending_drain())return -1;
     }
     if(!gpu_flush())return -1;
+    gpu_completion_invalidate();
     GpuPendingReadback *p=&g.pending[g.pending_count];
     p->has_stats=g.stats_required;p->publish_surface=1;p->surface_copy_pending=0;
     /* Allocation failure is recoverable before copying: use normal sync. */
@@ -901,6 +910,7 @@ static int gpu_pending_drain(void)
         GpuPendingReadback *p=&g.pending[i];
         if(!p->surface_copy_pending)continue;
         if(p->publish_surface) {
+            gpu_completion_invalidate();
             unsigned timing=gpu_timing_batch_begin(1);
             if(timing)gpu_timing_phase_begin(NV_GPU_TIME_COPY,(uint64_t)p->target.width*p->target.height);
             gpu_copy_dirty_surface((ID3D11Resource*)p->surface,(ID3D11Resource*)p->snapshot.buffer,
@@ -1027,6 +1037,18 @@ int nv_gpu_sync_completion(NvGpuCount *count)
     memset(count,0,sizeof *count);
     if(InterlockedCompareExchange(&s_startup,0,0)!=2 || !g.completion.enabled ||
        !g.native || g.native_diagnostics || g.selftest || s_capture || g.auto_enabled)return 0;
+    if(g.readback_failed)return -1;
+    if(!gpu_flush()){g.readback_failed=1;return -1;}
+    if(g.completion.reuse_enabled && g.completion.confirmed) {
+        if(FAILED(ID3D11Device_GetDeviceRemovedReason(g.device))) {
+            g.readback_failed=1;
+            return -1;
+        }
+        ++g.completion.reused;
+        nv2a_frame_profile_add(NV_FRAME_COMPLETION_REUSED,1);
+        if(g.active)g.completion.unpublished=1;
+        return 1;
+    }
     /* The four-byte marker follows every submitted draw and saved target
      * copy in the immediate context. Fences need GPU completion, while their
      * framebuffer pixels can remain resident until a CPU consumer arrives. */
@@ -1036,8 +1058,8 @@ int nv_gpu_sync_completion(NvGpuCount *count)
     if(!gpu_staging_buffer(&g.completion.staging,&g.completion.staging_bytes,4)){
         g.completion.enabled=0;return 0;
     }
-    if(!gpu_flush()){g.readback_failed=1;return -1;}
     uint32_t serial=++g.completion.serial;
+    nv2a_frame_profile_add(NV_FRAME_COMPLETION_MARKERS,1);
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.completion.marker.buffer,0,NULL,&serial,0,0);
     ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.completion.staging,
                                      (ID3D11Resource*)g.completion.marker.buffer);
@@ -1051,6 +1073,7 @@ int nv_gpu_sync_completion(NvGpuCount *count)
     uint32_t observed=0;memcpy(&observed,mapped.pData,4);
     ID3D11DeviceContext_Unmap(g.context,(ID3D11Resource*)g.completion.staging,0);
     if(observed!=serial){g.readback_failed=1;fprintf(stderr,"[GPU-COMPLETION] marker mismatch\n");return -1;}
+    g.completion.confirmed=g.completion.reuse_enabled;
     double elapsed=gpu_ms()-begin;
     ++g.completion.waits;g.completion.wait_ms+=elapsed;
     nv2a_frame_profile_add(NV_FRAME_COMPLETION_MAP,elapsed);
@@ -1070,6 +1093,7 @@ int nv_gpu_sync_report(NvGpuCount *count)
     }
     if(!gpu_flush())return -1;
     if(!g.stats_required){++g.report_fallback;return 0;}
+    gpu_completion_invalidate();
     ID3D11DeviceContext_CopyResource(g.context,(ID3D11Resource*)g.stats.readback,
                                      (ID3D11Resource*)g.stats.buffer);
     D3D11_MAPPED_SUBRESOURCE stats={0};double begin=gpu_ms();
@@ -1258,6 +1282,7 @@ static int gpu_target(const NvGpuState *s,uint8_t *color,float *depth,unsigned s
     }
     if(g.native) {
         if(color_changed || depth_changed) {
+            gpu_completion_invalidate();
             for(unsigned at=0;at<bytes/4;at++) {
                 g.surface_upload[at].color=g.color_upload[at];
                 memcpy(&g.surface_upload[at].depth_bits,g.depth_upload+at,4);
@@ -1435,7 +1460,10 @@ static GpuTexture *gpu_texture(const NvGpuTexture *meta,const NvGpuTextureSource
     if(bridge) {
         if(!gpu_bridge_pack(bridge,base,(unsigned)texels))goto fail;
         slot->gpu_serial=bridge->serial;
-    } else ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.atlas.buffer,0,&box,slot->decoded,0,0);
+    } else {
+        gpu_completion_invalidate();
+        ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.atlas.buffer,0,&box,slot->decoded,0,0);
+    }
     slot->atlas_base=base;
     slot->meta=*meta;slot->address=source->raw;slot->palette_address=source->palette;
     slot->bytes=source->bytes;slot->palette_bytes=source->palette_bytes;
@@ -1553,6 +1581,7 @@ static unsigned gpu_native_span(unsigned first,int *simple,unsigned *literal,int
 static int gpu_flush(void)
 {
     if(!g.queued_count)return 1;
+    gpu_completion_invalidate();
     /* Benchmark only a fresh target's real immutable queue. No prior GPU
      * writes may be missing from its CPU input, and captures remain exact. */
     if(g.auto_enabled && !g.auto_done && !g.auto_busy && !g.selftest && g.native &&
@@ -1722,6 +1751,7 @@ static int gpu_clear(unsigned left,unsigned top,unsigned right,unsigned bottom,u
     if(left>=right || top>=bottom || right>g.target.width || bottom>g.target.height)return gpu_clear_skip(5);
     double begin=gpu_ms();
     if(!gpu_flush())return -1;
+    gpu_completion_invalidate();
     uint32_t parameters[9]={g.target.width,g.target.height,left,top,right,bottom,mask,color,0};
     memcpy(parameters+8,&depth,4);
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)g.clear_parameters.buffer,0,NULL,parameters,0,0);
@@ -1818,6 +1848,7 @@ int nv_gpu_reset_report(void)
     if(g.active) {
         if(!gpu_flush())return -1;
         if(g.stats_initialized) {
+            gpu_completion_invalidate();
             ID3D11UnorderedAccessView *uav[3]={NULL,NULL,g.stats.uav};
             ID3D11DeviceContext_CSSetShader(g.context,g.report_shader,NULL,0);
             ID3D11DeviceContext_CSSetUnorderedAccessViews(g.context,0,3,uav,NULL);
@@ -2316,6 +2347,7 @@ static int gpu_initialize(void)
     const char *diagnostics=getenv("RECOMP_GPU_DIAGNOSTIC_COUNTERS");
     g.native_diagnostics=diagnostics && atoi(diagnostics)>0;
     {const char *e=getenv("RECOMP_GPU_COMPLETION_TOKEN");g.completion.enabled=e && atoi(e)>0;}
+    {const char *e=getenv("RECOMP_GPU_COMPLETION_REUSE");g.completion.reuse_enabled=e && atoi(e)>0;}
     {const char *e=getenv("RECOMP_GPU_FEEDBACK_SNAPSHOT");g.completion.feedback_enabled=!e || atoi(e)>0;}
     const char *local_rov=getenv("RECOMP_GPU_LOCAL_ROV");
     g.local_rov=local_rov && atoi(local_rov)>0;
@@ -3285,6 +3317,9 @@ void nv_gpu_report(void)
         g.completion.feedback_enabled,(unsigned long long)g.completion.feedback_snapshots,
         (unsigned long long)g.completion.feedback_fallbacks);
     g.completion.waits=g.completion.avoided_pixels=g.completion.access_drains=0;
+    if(g.completion.reuse_enabled)
+        fprintf(stderr,"[GPU-COMPLETION-REUSE] reused=%llu\n",(unsigned long long)g.completion.reused);
+    g.completion.reused=0;
     g.completion.feedback_snapshots=g.completion.feedback_fallbacks=0;g.completion.wait_ms=0;
     for(unsigned shape=0;shape<4;shape++){
         const char *name=shape==0?"640x480":shape==1?"256x256":shape==2?"128x128":"other";

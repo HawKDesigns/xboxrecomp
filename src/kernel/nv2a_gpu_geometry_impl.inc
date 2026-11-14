@@ -395,6 +395,7 @@ static int gpu_raw_resident(NvRawMesh *m)
     memset(meta+16,0,sizeof meta[16]);meta[16].offset=(first+m->byte_count)/4;
     D3D11_BOX data={first,0,0,first+m->byte_count,1,1},indices={first+m->byte_count,0,0,first+bytes,1,1};
     unsigned slot=(unsigned)(m-raw.mesh);D3D11_BOX attrs={slot*sizeof meta,0,0,(slot+1)*sizeof meta,1,1};
+    gpu_completion_invalidate();
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)raw.atlas.buffer,0,&data,m->bytes,0,0);
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)raw.atlas.buffer,0,&indices,m->indices,0,0);
     ID3D11DeviceContext_UpdateSubresource(g.context,(ID3D11Resource*)raw.metadata.buffer,0,&attrs,meta,0,0);

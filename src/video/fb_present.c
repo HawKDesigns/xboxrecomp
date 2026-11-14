@@ -450,12 +450,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     }
-    if ((m == WM_KEYDOWN || m == WM_KEYUP) && w >= VK_F4 && w <= VK_F7 &&
+    if ((m == WM_KEYDOWN || m == WM_KEYUP) &&
+        ((w >= VK_F4 && w <= VK_F7) || w == VK_F1 || w == VK_F10) &&
         xbox_frame_trace_enabled()) {
         if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
             const enum XboxTracePhase phases[] = {XBOX_PHASE_UNMARKED, XBOX_PHASE_COUNTDOWN,
                                                   XBOX_PHASE_AHEAD, XBOX_PHASE_BEHIND};
-            enum XboxTracePhase phase = phases[w - VK_F4];
+            enum XboxTracePhase phase = w == VK_F1 ? XBOX_PHASE_RIDER_MENU :
+                                        w == VK_F10 ? XBOX_PHASE_ATV_MENU : phases[w - VK_F4];
             xbox_frame_trace_note(XBOX_TRACE_WINDOW, XBOX_TRACE_PHASE, 0, phase, 1, 0);
         }
         return 0;
