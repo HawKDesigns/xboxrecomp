@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "platform/video_options.h"
 #include <string.h>
 #include <time.h>
 
@@ -120,7 +121,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * settings. On real hardware these are stored in the 256-byte EEPROM on the
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
- *   - Video: NTSC, widescreen+HDTV enabled
+ *   - Video: NTSC, 4:3 unless the player selects widescreen
  *   - Language: English
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
@@ -199,6 +200,12 @@ static void tz_init(void)
 #endif
 }
 
+static ULONG eeprom_video_flags(void)
+{
+    return XC_VIDEO_FLAGS_60Hz |
+           (xbox_video_widescreen() ? XC_VIDEO_FLAGS_WIDESCREEN : 0);
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -220,9 +227,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC 4:3, 480i at 60 Hz. The old low-half-word value read as 0 (#301). */
+        /* Keep the high-word EEPROM flags in both forms of the query. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_60Hz;
+            *(PULONG)Value = eeprom_video_flags();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -313,7 +320,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
-        { ULONG v = XC_VIDEO_FLAGS_60Hz; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = eeprom_video_flags(); memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
         if (Type) *Type = 3;

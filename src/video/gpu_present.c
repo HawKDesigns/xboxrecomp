@@ -6,11 +6,10 @@
  * presents the flipped frame through it, vsync-paced. The frame (the guest's
  * A8R8G8B8, i.e. B8G8R8A8 in memory order) is uploaded into its own texture
  * and drawn into a back buffer the size of the window's client area,
- * letterboxed to the frame's aspect ratio on black -- the window can be any
- * size (or borderless fullscreen) without stretching the picture.
+ * letterboxed to the selected display aspect ratio on black.
  *
  * Opt-in with RECOMP_D3D_PRESENT=1; anything that fails falls back to GDI.
- * Linear filtering, RECOMP_PRESENT_FILTER=point for sharp pixels;
+ * RECOMP_PRESENT_FILTER chooses how the frame is scaled;
  * RECOMP_PRESENT_VSYNC=0 presents without waiting for the display, as the
  * SDL window does.
  */
@@ -25,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_present.h"
+#include "present_layout.h"
 
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
@@ -39,6 +39,8 @@ static HWND                      s_hwnd;
 static uint32_t                  s_w, s_h;      /* frame size */
 static uint32_t                  s_bw, s_bh;    /* back buffer (client) size */
 static int                       s_vsync = 1;
+static int                       s_widescreen;
+static XboxPresentFilter         s_filter;
 
 /* A triangle covering the viewport, from the vertex id; uv 0..1. */
 static const char s_hlsl[] =
@@ -99,8 +101,10 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     D3D11_SAMPLER_DESC smp;
     ID3DBlob *vsb, *psb;
     HRESULT hr;
-    const char *v = getenv("RECOMP_PRESENT_VSYNC"), *f = getenv("RECOMP_PRESENT_FILTER");
+    const char *v = getenv("RECOMP_PRESENT_VSYNC");
 
+    s_widescreen = xbox_video_widescreen();
+    s_filter = xbox_present_filter(XBOX_PRESENT_LINEAR);
     if (v && v[0] == '0')
         s_vsync = 0;
     s_hwnd = hwnd;
@@ -139,8 +143,8 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ZeroMemory(&smp, sizeof smp);
-    smp.Filter = (f && (f[0] == 'p' || f[0] == 'P')) ? D3D11_FILTER_MIN_MAG_MIP_POINT
-                                                     : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.Filter = s_filter == XBOX_PRESENT_LINEAR ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                                                : D3D11_FILTER_MIN_MAG_MIP_POINT;
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     vsb = compile("vs", "vs_4_0");
@@ -161,9 +165,10 @@ int gpu_present_init(HWND hwnd, uint32_t width, uint32_t height)
     }
     ID3D10Blob_Release(vsb);
     ID3D10Blob_Release(psb);
-    fprintf(stderr, "  [D3D] presenting through D3D11 (%ux%u frame, vsync %s, %s filter)\n",
-            width, height, s_vsync ? "on" : "off",
-            smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear");
+    fprintf(stderr, "  [D3D] presenting through D3D11 (%ux%u frame, %s aspect, vsync %s, filter %s)\n",
+            width, height, s_widescreen ? "16:9" : "original", s_vsync ? "on" : "off",
+            s_filter == XBOX_PRESENT_LINEAR ? "linear" :
+            s_filter == XBOX_PRESENT_POINT ? "point" : "off");
     return 1;
 }
 
@@ -174,7 +179,6 @@ int gpu_present_frame(const uint32_t *pixels, int *shown)
     static const float black[4] = {0, 0, 0, 1};
     D3D11_VIEWPORT vp;
     uint32_t cw, ch;
-    float sx, sy;
 
     *shown = 0;
     if (!s_rtv || !pixels)
@@ -194,13 +198,12 @@ int gpu_present_frame(const uint32_t *pixels, int *shown)
                                           pixels, s_w * 4, 0);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
-    /* The largest rectangle of the frame's shape that fits, centred. */
-    sx = (float)s_bw / (float)s_w;
-    sy = (float)s_bh / (float)s_h;
-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
-    vp.Height = (float)s_h * (sx < sy ? sx : sy);
-    vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
-    vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
+    XboxPresentRect pic = xbox_present_rect((int)cw, (int)ch, (int)s_w, (int)s_h,
+                                            s_widescreen, s_filter);
+    vp.Width = (float)pic.width;
+    vp.Height = (float)pic.height;
+    vp.TopLeftX = (float)pic.x;
+    vp.TopLeftY = (float)pic.y;
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

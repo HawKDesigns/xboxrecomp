@@ -46,6 +46,7 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "present_layout.h"
 #include "platform/frame_trace.h"
 #include "platform/thread_cpu.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
@@ -314,6 +315,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint32_t pending_draw_id = 0, last_drawn_id = 0;
     const char *e;
     int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
+    int widescreen = xbox_video_widescreen();
+    XboxPresentFilter filter = xbox_present_filter(XBOX_PRESENT_POINT);
 
     /* Ctrl-C and SIGTERM keep their default meaning; SDL would turn them
      * into an SDL_QUIT that a headless run never reads. Set before the
@@ -329,7 +332,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     if (scale < 1 || scale > 8)
         scale = 2;
 
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, filter == XBOX_PRESENT_LINEAR ? "linear" : "nearest");
     if (SDL_Init(FBWIN_SDL_SUBSYSTEMS) != 0) {
         fprintf(stderr, "  [FBWIN] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
@@ -341,7 +344,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                           (int)FB_W * scale, (int)FB_H * scale,
+                           xbox_present_display_width(FB_W, FB_H, widescreen) * scale,
+                           (int)FB_H * scale,
                            window_flags);
     ren = win ? SDL_CreateRenderer(win, -1,
                                    vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
@@ -354,7 +358,6 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
-    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
     {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
@@ -475,10 +478,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             dirty = 1;
         }
         if (dirty) {
+            int width, height, drawn = 0;
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            int drawn = tex && SDL_RenderCopy(ren, tex, NULL, NULL) == 0;
+            if (tex && SDL_GetRendererOutputSize(ren, &width, &height) == 0
+                    && width > 0 && height > 0) {
+                XboxPresentRect pic = xbox_present_rect(width, height, FB_W, FB_H,
+                                                        widescreen, filter);
+                SDL_Rect dest = {pic.x, pic.y, pic.width, pic.height};
+                drawn = SDL_RenderCopy(ren, tex, NULL, &dest) == 0;
+            }
             SDL_RenderPresent(ren);
             /* One draw record per distinct frame the host actually showed. */
             if (drawn && pending_draw_id && pending_draw_id != last_drawn_id) {

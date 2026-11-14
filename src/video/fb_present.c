@@ -39,6 +39,7 @@
  * them. */
 #include "keyboard.h"   /* src/input */
 #include "gpu_present.h"
+#include "present_layout.h"
 #include "platform/frame_trace.h"
 #include "platform/host_time.h"
 #include "platform/thread_cpu.h"
@@ -55,6 +56,8 @@ static volatile LONG s_fb_running;
 static volatile LONG s_fb_closed;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+static XboxPresentFilter s_filter;
+static int s_widescreen;
 
 /* A finished frame, taken at the flip and shown until the next one.
  *
@@ -650,7 +653,7 @@ static int gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
 {
     static LONG lw, lh;
     RECT c;
-    LONG cw, ch, w, h;
+    LONG cw, ch;
     GetClientRect(hwnd, &c);
     cw = c.right - c.left; ch = c.bottom - c.top;
     if (cw <= 0 || ch <= 0)
@@ -659,14 +662,13 @@ static int gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
     }
-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
-        w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
-    } else {
-        h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
+    XboxPresentRect pic = xbox_present_rect(cw, ch, (int)s_fb_width,
+                                            (int)s_fb_height, s_widescreen, s_filter);
+    SetStretchBltMode(hdc, s_filter == XBOX_PRESENT_LINEAR ? HALFTONE : COLORONCOLOR);
+    if (s_filter == XBOX_PRESENT_LINEAR) {
+        SetBrushOrgEx(hdc, 0, 0, NULL);  /* HALFTONE wants it after the mode */
     }
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
-    int lines = StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
+    int lines = StretchDIBits(hdc, pic.x, pic.y, pic.width, pic.height,
                              0, 0, (int)s_fb_width, (int)s_fb_height,
                              s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
     return lines != 0 && lines != GDI_ERROR;
@@ -697,6 +699,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
     (void)unused;
     xbox_frame_trace_thread(XBOX_TRACE_PRESENTER);
+    s_filter = xbox_present_filter(XBOX_PRESENT_LINEAR);
+    s_widescreen = xbox_video_widescreen();
 
     {
         WNDCLASSA wc;
@@ -721,7 +725,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
         for (;; scale--) {
             r.left = 0; r.top = 0;
-            r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+            r.right = xbox_present_display_width((int)s_fb_width, (int)s_fb_height,
+                                                 s_widescreen) * scale;
+            r.bottom = (LONG)s_fb_height * scale;
             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
             if (scale <= 1 || (r.right - r.left <= work.right - work.left
                                && r.bottom - r.top <= work.bottom - work.top))
