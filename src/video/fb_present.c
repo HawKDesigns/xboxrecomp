@@ -480,10 +480,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     }
-    if ((m == WM_KEYDOWN || m == WM_KEYUP) &&
+    /* Bare F10 arrives as a system key. Consume its press, repeat and release
+     * while recording phases, otherwise DefWindowProc activates the window
+     * menu and holds the presenter in a modal loop. */
+    if ((m == WM_KEYDOWN || m == WM_KEYUP ||
+         ((m == WM_SYSKEYDOWN || m == WM_SYSKEYUP) && w == VK_F10 &&
+          !(l & ((LPARAM)1 << 29)))) &&
         ((w >= VK_F4 && w <= VK_F7) || w == VK_F1 || w == VK_F10) &&
         xbox_frame_trace_enabled()) {
-        if (m == WM_KEYDOWN && !(l & ((LPARAM)1 << 30))) {
+        if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && !(l & ((LPARAM)1 << 30))) {
             const enum XboxTracePhase phases[] = {XBOX_PHASE_UNMARKED, XBOX_PHASE_COUNTDOWN,
                                                   XBOX_PHASE_AHEAD, XBOX_PHASE_BEHIND};
             enum XboxTracePhase phase = w == VK_F1 ? XBOX_PHASE_RIDER_MENU :
